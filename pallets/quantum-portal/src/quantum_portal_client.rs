@@ -277,7 +277,7 @@ impl<T: Config> QuantumPortalClient<T> {
         let (block_details, _) = self.mined_block_by_nonce(remote_chain_id, block_nonce)?;
 
         let method_signature =
-            b"finalizeSingleSigner(uint256,uint256,bytes32,address[],bytes32,uint64,bytes)";
+            b"finalize(uint256,uint256,bytes32,address[],bytes32,uint64,bytes)";
 
         let salt = Token::FixedBytes(block_details.block_hash.as_ref().to_vec());
         let finalizer_hash = Token::FixedBytes(block_details.block_hash.as_ref().to_vec());
@@ -438,10 +438,10 @@ impl<T: Config> QuantumPortalClient<T> {
 
         // set timestamp 1hr from now
         let current_timestamp = source_block.timestamp;
-        let expiry_buffer = core::time::Duration::from_secs(3600u64);
+        let expiry_buffer = core::time::Duration::from_secs(36000u64);
         let expiry_time = current_timestamp.saturating_add(expiry_buffer.as_secs());
         let expiry = Token::Uint(U256::from(expiry_time));
-        let salt = Token::FixedBytes(vec![0u8, 0u8]);
+        let salt = Token::FixedBytes(vec![23u8, 24u8]);
 
         let tx_vec: Vec<Token> = txs
             .iter()
@@ -485,7 +485,7 @@ impl<T: Config> QuantumPortalClient<T> {
                 expiry,
                 Token::Bytes(multi_sig),
             ],
-            None, //Some(U256::from(1000000 as u32)), // None,
+            Some(U256::from(1000000 as u32)), // None,
             None, //Some(U256::from(60000000000 as u64)), // None,
             U256::zero(),
             None,
