@@ -118,6 +118,7 @@ impl BTCClient {
 		Ok(tx)
 	}
 
+	// TODO : Use an if-else script to handle threshold signature pallet failure
 	pub fn generate_taproot_script(validators: Vec<Vec<u8>>) -> Script {
 		// we follow a simple approach here, the first validator is necessary, and the rest follow a
 		// threshold model
@@ -129,6 +130,7 @@ impl BTCClient {
 			.map(|x| XOnlyPublicKey::from_slice(x).unwrap())
 			.collect::<Vec<_>>();
 		wallet_script.clone().push_x_only_key(&x_pub_keys.first().unwrap());
+		wallet_script.clone().push_opcode(all::OP_CHECKSIGVERIFY);
 
 		// calculate the threshold value
 		// since one key is required, the threshold would be the remaining keys - 1

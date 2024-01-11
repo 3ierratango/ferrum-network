@@ -85,7 +85,7 @@ pub struct Round1Package {
 )]
 pub struct Round2Package {
 	pub header: Vec<u8>,
-    pub signing_share: Vec<u8>,
+	pub signing_share: Vec<u8>,
 }
 
 pub type SignatureMap = BTreeMap<Vec<u8>, Vec<u8>>;
