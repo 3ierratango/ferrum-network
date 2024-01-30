@@ -41,6 +41,11 @@ pub struct BTCClient {
 }
 
 impl BTCClient {
+	/// Generate a BTC pool address based on the provided validators' public keys.
+	///
+	/// This function constructs a BTC pool address using the taproot scheme with the given
+	/// validators' public keys. It ensures connectivity to the BTC client, generates taproot
+	/// scripts, and creates a taproot address for the BTC pool.
 	pub fn generate_pool_address_from_signers(validators: Vec<Vec<u8>>) -> Result<Vec<u8>, String> {
 		let secp = Secp256k1::new();
 
@@ -72,6 +77,37 @@ impl BTCClient {
 		Ok(address)
 	}
 
+	/// Generate a Bitcoin transaction based on a withdrawal request from the BTC pool.
+	///
+	/// This function constructs a Bitcoin transaction for a withdrawal request, including inputs,
+	/// outputs, and fees. It uses the taproot scheme and fetches relevant UTXOs to fund the
+	/// transaction. The resulting transaction is returned on success.
+	///
+	/// # Parameters
+	///
+	/// - `recipient`: The recipient's Bitcoin address encoded as a vector of bytes.
+	/// - `amount`: The amount to be withdrawn in satoshis.
+	/// - `validators`: A vector containing public keys of validators participating in the BTC pool.
+	/// - `current_pool_address`: The current pool's Bitcoin address encoded as a vector of bytes.
+	///
+	/// # Returns
+	///
+	/// Returns a `Result` with the constructed Bitcoin transaction on success, or an error message
+	/// on failure.
+	///
+	/// # Errors
+	///
+	/// Returns a `String` error message if there are issues establishing a connection to the BTC
+	/// client, if taproot-related operations fail, or if UTXO fetching encounters problems.
+	///
+	/// # Remarks
+	///
+	/// - The function uses the `Client` from the `bitcoin` crate to connect to the BTC client.
+	/// - It constructs taproot scripts and calculates the taproot address for the BTC pool.
+	/// - UTXOs are fetched using the constructed taproot address.
+	/// - The transaction includes inputs, outputs, and fees based on the withdrawal request.
+	/// - The calculated fees are logged, and the function returns the constructed transaction on
+	///   success.
 	pub fn generate_transaction_from_withdrawal_request(
 		recipient: Vec<u8>,
 		amount: u32,
@@ -168,6 +204,20 @@ impl BTCClient {
 		vec![script_with_threshold_required, script_without_threshold_required]
 	}
 
+	/// Generate a Taproot script with a required signer and threshold model for additional signers.
+	///
+	/// This function constructs a Taproot script with a required first signer and a threshold model
+	/// for additional signers. The first validator's public key is necessary for spending, and the
+	/// rest follow a threshold model, where a certain number of additional signatures are required.
+	///
+	/// # Parameters
+	///
+	/// - `validators`: A vector containing public keys of validators participating in the threshold
+	///   signature scheme.
+	///
+	/// # Returns
+	///
+	/// Returns a `Script` representing the generated Taproot script.
 	pub fn generate_taproot_script_with_required_signer(validators: Vec<Vec<u8>>) -> Script {
 		// we follow a simple approach here, the first validator is necessary, and the rest follow a
 		// threshold model
@@ -200,6 +250,21 @@ impl BTCClient {
 		wallet_script.into_script()
 	}
 
+	/// Generate a Taproot script without a required signer but with a threshold model for
+	/// additional signers.
+	///
+	/// This function constructs a Taproot script without requiring a specific first signer, but
+	/// instead, it follows a threshold model for additional signers. A certain number of signatures
+	/// are required to spend from the Taproot script.
+	///
+	/// # Parameters
+	///
+	/// - `validators`: A vector containing public keys of validators participating in the threshold
+	///   signature scheme.
+	///
+	/// # Returns
+	///
+	/// Returns a `Script` representing the generated Taproot script.
 	pub fn generate_taproot_script_without_required_signer(validators: Vec<Vec<u8>>) -> Script {
 		// We create two scripts for taproot tree here
 		// we follow a simple approach here, the first validator is necessary, and the rest follow a
@@ -240,6 +305,22 @@ impl BTCClient {
 		vec_tx_in
 	}
 
+	/// Filter and select the needed UTXOs (Unspent Transaction Outputs) to cover the specified
+	/// amount.
+	///
+	/// This function takes a target amount and a list of available UTXOs, then filters and selects
+	/// the UTXOs needed to cover the target amount. The UTXOs are sorted by age, and the oldest
+	/// UTXOs are used first.
+	///
+	/// # Parameters
+	///
+	/// - `amount`: The target amount that needs to be covered by selecting UTXOs.
+	/// - `available`: A vector of `ListUnspentRes` representing the available UTXOs.
+	///
+	/// # Returns
+	///
+	/// Returns a tuple containing a vector of `TxIn` representing the selected UTXOs as transaction
+	/// inputs and the total amount covered by those UTXOs.
 	pub fn filter_needed_utxos(
 		amount: u64,
 		mut available: Vec<ListUnspentRes>,
@@ -275,6 +356,25 @@ impl BTCClient {
 		(tx_ins, total_amount)
 	}
 
+	/// Broadcasts a completed Bitcoin transaction to the network.
+	///
+	/// This function takes a completed Bitcoin transaction, recipient information, transaction
+	/// amount, signatures, and the current pool address to generate and broadcast the transaction
+	/// to the Bitcoin network.
+	///
+	/// # Parameters
+	///
+	/// - `transaction`: The serialized byte representation of the completed Bitcoin transaction.
+	/// - `recipient`: The recipient's Bitcoin address as a vector of bytes.
+	/// - `amount`: The transaction amount in satoshis.
+	/// - `signatures`: A map containing signatures from validators participating in the
+	///   transaction.
+	/// - `current_pool_address`: The current pool's Bitcoin address as a vector of bytes.
+	///
+	/// # Returns
+	///
+	/// Returns a `Result` containing the transaction ID (`Txid`) if the broadcast is successful, or
+	/// an error message as a `String` in case of failure.
 	pub fn broadcast_completed_transaction(
 		transaction: Vec<u8>,
 		recipient: Vec<u8>,

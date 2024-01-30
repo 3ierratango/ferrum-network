@@ -25,6 +25,31 @@ pub use types::*;
 mod btc_client;
 
 impl<T: Config> Pallet<T> {
+	/// Execute the offchain worker for BTC Pools.
+	///
+	/// This function is responsible for processing pending withdrawal requests and pending
+	/// transactions in the BTC Pools pallet. It checks for any withdrawals requested by users and
+	/// processes them, and it also handles any pending BTC transactions by interacting with the
+	/// specified BTC network based on the provided `btc_config`.
+	///
+	/// # Parameters
+	///
+	/// - `block_number`: The current block number.
+	/// - `btc_config`: BTC network configuration used for processing pending transactions.
+	///
+	/// # Errors
+	///
+	/// Returns an `OffchainResult` indicating the success or failure of the offchain worker
+	/// execution. In case of success, `Ok(())` is returned.
+	///
+	/// # Remarks
+	///
+	/// - If the pallet is paused (`IsPalletPaused` is set to true), the offchain worker is not
+	///   executed.
+	/// - Handles pending withdrawal requests by processing each withdrawal for the specified
+	///   recipient.
+	/// - Processes pending BTC transactions by interacting with the BTC network based on the
+	///   provided `btc_config`.
 	pub fn execute_btc_pools_offchain_worker(
 		block_number: u64,
 		btc_config: types::BTCConfig,
@@ -66,6 +91,32 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
+	/// Handle a withdrawal request for BTC Pools.
+	///
+	/// This function processes a withdrawal request by preparing a BTC transaction. The transaction
+	/// includes the recipient's address, withdrawal amount, a list of known validators, and the
+	/// current pool address. The generated transaction is then stored in the `PendingTransactions`
+	/// storage, awaiting further processing by the offchain worker.
+	///
+	/// # Parameters
+	///
+	/// - `recipient`: The recipient's BTC address to which the withdrawal amount is sent.
+	/// - `amount`: The amount of BTC to be withdrawn.
+	///
+	/// # Errors
+	///
+	/// Returns an `OffchainResult` indicating the success or failure of processing the withdrawal
+	/// request. In case of success, `Ok(())` is returned.
+	///
+	/// # Remarks
+	///
+	/// - The function generates a BTC transaction using the provided withdrawal request details.
+	/// - The transaction is stored in the `PendingTransactions` storage, awaiting offchain worker
+	///   execution.
+	/// - The `CurrentPoolAddress` and `RegisteredValidators` storages are used to gather necessary
+	///   information.
+	/// - If no BTC validators are found, the function panics with the message "No BTC validators
+	///   found!"
 	pub fn handle_withdrawal_request(recipient: Vec<u8>, amount: u32) -> OffchainResult<()> {
 		// TODO : We should have some queue here, now everyone tries to submit and only first one
 		// works let prepare a transaction for this withdrawal request
@@ -99,6 +150,33 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
+	/// Handle a pending BTC transaction for the BTC Pools pallet.
+	///
+	/// This function processes a pending BTC transaction by signing it with the configured signer's
+	/// private key. If the transaction has not been signed yet, the function signs the transaction
+	/// and stores the signature. If the threshold for the number of signatures is reached, the
+	/// transaction is considered processed and may be broadcast to the BTC chain.
+	///
+	/// # Parameters
+	///
+	/// - `hash`: The hash of the pending BTC transaction.
+	/// - `details`: Details of the pending BTC transaction, including recipient, amount, and
+	///   signatures.
+	/// - `btc_config`: BTC configuration parameters.
+	///
+	/// # Errors
+	///
+	/// Returns an `OffchainResult` indicating the success or failure of processing the pending BTC
+	/// transaction. In case of success, `Ok(())` is returned.
+	///
+	/// # Remarks
+	///
+	/// - The function signs the transaction using the signer's private key and stores the
+	///   signature.
+	/// - If the number of signatures reaches the configured threshold, the transaction is
+	///   considered processed, and an event is emitted.
+	/// - The `CurrentPoolAddress` and `CurrentPoolThreshold` storages are used to gather necessary
+	///   information.
 	pub fn handle_pending_transaction(
 		hash: Vec<u8>,
 		details: TransactionDetails,
