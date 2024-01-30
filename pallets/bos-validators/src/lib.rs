@@ -106,6 +106,8 @@ pub mod pallet {
 	pub trait Config: frame_system::Config {
 		/// Because this pallet emits events, it depends on the runtime's definition of an event.
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
+		// Pools handler trait
+		type BosPoolsHandler: BosPoolsHandler;
 		/// Type representing the weight of this pallet
 		type WeightInfo: WeightInfo;
 	}
@@ -150,18 +152,52 @@ pub mod pallet {
 	/// Current signatures for data in signing queue
 	#[pallet::storage]
 	#[pallet::getter(fn signatures)]
-	pub type Signatures<T> = StorageValue<_, Vec<Vec<u8>>, OptionQuery>;
+	pub type PartialSignatures<T> = StorageMap<_, Blake2_128Concat, u32, Vec<u8>>;
 
 	/// Current pub key
 	#[pallet::storage]
 	#[pallet::getter(fn current_pub_key)]
 	pub type CurrentPubKey<T> = StorageValue<_, Vec<u8>, OptionQuery>;
 
+	/// Next pub key
+	#[pallet::storage]
+	#[pallet::getter(fn current_pub_key)]
+	pub type NextPubKey<T> = StorageValue<_, Vec<u8>, OptionQuery>;
+
+	/// Next quorom
+	#[pallet::storage]
+	#[pallet::getter(fn next_quorom)]
+	pub type NextQuorom<T> = StorageValue<_, Vec<Vec<u8>>, OptionQuery>;
+
+	/// Next quorom threshold
+	#[pallet::storage]
+	#[pallet::getter(fn current_pool_threshold)]
+	pub type NextPoolThreshold<T> = StorageValue<_, u32, ValueQuery, DefaultThreshold<T>>;
+
+	/// Should execute new pub key generation
+	#[pallet::storage]
+	#[pallet::getter(fn current_pub_key)]
+	pub type ExecuteNextPubKey<T> = StorageValue<_, bool, ValueQuery>;
+
+	/// Emergency signing queue - will execute if pallet is paused also
+	#[pallet::storage]
+	#[pallet::getter(fn signing_queue)]
+	pub type EmergencySigningQueue<T> = StorageValue<_, Vec<u8>, OptionQuery>;
+
+	/// Current pub key
+	#[pallet::storage]
+	#[pallet::getter(fn admin_role)]
+	pub type AdminRole<T> = StorageValue<_, T::AccountId, OptionQuery>;
+
+	/// Current pub key
+	#[pallet::storage]
+	#[pallet::getter(fn is_pallet_paused)]
+	pub type IsPalletPaused<T> = StorageValue<_, bool, ValueQuery>;
+
 	// Registered BOS validators
 	#[pallet::storage]
 	#[pallet::getter(fn round_1_shares)]
-	pub type Round1Shares<T> =
-		StorageDoubleMap<_, Blake2_128Concat, u32, Blake2_128Concat, u32, Round1Package>;
+	pub type Round1Shares<T> = StorageMap<_, Blake2_128Concat, u32, Round1Package>;
 
 	#[pallet::storage]
 	#[pallet::getter(fn round_2_shares)]
@@ -171,10 +207,9 @@ pub mod pallet {
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		WithdrawalSubmitted { address: Vec<u8>, amount: u32 },
-		TransactionSubmitted { address: Vec<u8>, amount: u32, hash: Vec<u8> },
-		TransactionSignatureSubmitted { hash: Vec<u8>, signature: Vec<u8> },
-		TransactionProcessed { hash: Vec<u8> },
+		Phase1ShareSubmitted { submitter: Vec<u8> },
+		Phase2ShareSubmitted { submitter: Vec<u8>, recipient: Vec<u8> },
+		KeygenCompleted { pub_key: Vec<u8> },
 	}
 
 	// Errors inform users that something went wrong.
@@ -248,6 +283,59 @@ pub mod pallet {
 			// TODO : Remove after testing
 			let who = ensure_signed(origin)?;
 			SigningQueue::<T>::set(Some(data));
+			Ok(())
+		}
+
+		#[pallet::call_index(5)]
+		#[pallet::weight(0)]
+		pub fn set_admin_role(origin: OriginFor<T>, admin_account: T::AccountId) -> DispatchResult {
+			// TODO : Ensure this is through democracy/sudo only
+			let who = ensure_signed(origin)?;
+			AdminRole::<T>::set(Some(admin_account));
+			Ok(())
+		}
+
+		#[pallet::call_index(6)]
+		#[pallet::weight(0)]
+		pub fn pause_worker(origin: OriginFor<T>, is_paused: bool) -> DispatchResult {
+			// TODO : Ensure this is through democracy/sudo only
+			let who = ensure_signed(origin)?;
+			IsPalletPaused::<T>::set(is_paused);
+			Ok(())
+		}
+
+		#[pallet::call_index(7)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn generate_next_validator_key(
+			origin: OriginFor<T>,
+			pub_key: Vec<u8>,
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			// pause this pallet
+			IsPalletPaused::<T>::set(true);
+
+			// set new pub key execution to work
+			ExecuteNextPubKey::<T>::set(true);
+
+			Ok(())
+		}
+
+		#[pallet::call_index(7)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn switch_to_next_quorom_and_key(
+			origin: OriginFor<T>,
+			pub_key: Vec<u8>,
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			// pause this pallet
+			IsPalletPaused::<T>::set(true);
+
+			let next_quorom = NextQuorom::<T>::get();
+			let next_pub_key = NextPubKey::<T>::get();
+
+			CurrentQuorom::<T>::set(next_quorom);
+			CurrentPubKey::<T>::set(next_pub_key);
+
 			Ok(())
 		}
 	}

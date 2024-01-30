@@ -36,6 +36,7 @@ use sp_runtime::offchain::{
 	storage::StorageValueRef,
 	storage_lock::{StorageLock, Time},
 };
+pub mod traits;
 use sp_std::collections::btree_map::BTreeMap;
 pub use weights::*;
 pub mod offchain;
@@ -74,7 +75,7 @@ pub mod pallet {
 
 	/// Configure the pallet by specifying the parameters and types on which it depends.
 	#[pallet::config]
-	pub trait Config: frame_system::Config {
+	pub trait Config: frame_system::Config + pallet_threshold_validators::Config {
 		/// Because this pallet emits events, it depends on the runtime's definition of an event.
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 		/// Type representing the weight of this pallet
@@ -106,6 +107,24 @@ pub mod pallet {
 	pub type RegisteredValidators<T> =
 		StorageMap<_, Blake2_128Concat, <T as frame_system::Config>::AccountId, Vec<u8>>;
 
+	#[pallet::storage]
+	#[pallet::getter(fn next_pool_address)]
+	pub type NextPoolAddress<T> = StorageValue<_, Vec<u8>, ValueQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn current_pool_threshold)]
+	pub type NextPoolThreshold<T> = StorageValue<_, u32, ValueQuery, DefaultThreshold<T>>;
+
+	/// Current pending withdrawals
+	#[pallet::storage]
+	#[pallet::getter(fn pending_withdrawals)]
+	pub type EmergencyPendingWithdrawals<T> = StorageMap<_, Blake2_128Concat, Vec<u8>, u32>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn registered_validators)]
+	pub type NextRegisteredValidators<T> =
+		StorageMap<_, Blake2_128Concat, <T as frame_system::Config>::AccountId, Vec<u8>>;
+
 	/// Current pending transactions
 	#[pallet::storage]
 	#[pallet::getter(fn pending_transactions)]
@@ -127,6 +146,7 @@ pub mod pallet {
 		NoneValue,
 		/// Errors should have helpful documentation associated with them.
 		StorageOverflow,
+		RequiresNextTresholdKey,
 	}
 
 	#[pallet::hooks]
@@ -267,6 +287,64 @@ pub mod pallet {
 			let who = ensure_signed(origin)?;
 
 			CurrentPoolAddress::<T>::set(pub_key);
+
+			Ok(())
+		}
+
+		#[pallet::call_index(5)]
+		#[pallet::weight(0)]
+		pub fn set_admin_role(origin: OriginFor<T>, admin_account: T::AccountId) -> DispatchResult {
+			// TODO : Ensure this is through democracy/sudo only
+			let who = ensure_signed(origin)?;
+			AdminRole::<T>::set(Some(admin_account));
+			Ok(())
+		}
+
+		#[pallet::call_index(6)]
+		#[pallet::weight(0)]
+		pub fn pause_worker(origin: OriginFor<T>, is_paused: bool) -> DispatchResult {
+			// TODO : Ensure this is through democracy/sudo only
+			let who = ensure_signed(origin)?;
+			IsPalletPaused::<T>::set(is_paused);
+			Ok(())
+		}
+
+		#[pallet::call_index(7)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn generate_new_pool_address(origin: OriginFor<T>) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			// pause this pallet
+			IsPalletPaused::<T>::set(true);
+
+			// check for new key in bos validators pallet
+			let next_threshold_validator_pub_key =
+				<pallet_threshold_validators::Pallet<T>>::NextPubKey::<T>::get()
+					.ok_or(Error::<T>::RequiresNextTresholdKey);
+
+			let validators = RegisteredValidators::<T>::iter().collect::<Vec<_>>();
+
+			let mut pool_signers = vec![];
+			pool_signers.push(next_threshold_validator_pub_key);
+			pool_signers.push(validators);
+			let new_pool_address = BTCClient::generate_pool_address_from_signers(pool_signers);
+
+			NextPoolAddress::<T>::set(new_pool_address);
+
+			Ok(())
+		}
+
+		#[pallet::call_index(8)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn switch_new_pool_address(origin: OriginFor<T>) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			// pause this pallet
+			IsPalletPaused::<T>::set(true);
+
+			let next_pool_address =
+				NextPoolAddress::<T>::get().ok_or(Error::<T>::RequiresNextPoolAddress);
+
+			CurrentPoolAddress::<T>::set(next_pool_address);
+			NextPoolAddress::<T>::clear();
 
 			Ok(())
 		}

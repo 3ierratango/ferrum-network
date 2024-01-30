@@ -82,45 +82,52 @@ pub mod pallet {
 		StorageOverflow,
 	}
 
-	// #[pallet::hooks]
-	// impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
-	// 	fn offchain_worker(block_number: BlockNumberFor<T>) {
-	// 		log::info!("BTCPools OffchainWorker : Start Execution");
-	// 		log::info!("Reading configuration from storage");
+	#[pallet::hooks]
+	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+		fn offchain_worker(block_number: BlockNumberFor<T>) {
+			log::info!("BTCPools OffchainWorker : Start Execution");
+			log::info!("Reading configuration from storage");
 
-	// 		let mut lock = StorageLock::<Time>::new(BTC_OFFCHAIN_SIGNER_CONFIG_PREFIX);
-	// 		if let Ok(_guard) = lock.try_lock() {
-	// 			let network_config = StorageValueRef::persistent(BTC_OFFCHAIN_SIGNER_CONFIG_KEY);
+			// if the pallet is paused, we dont execute the offchain worker
+			if IsPalletPaused::<T>::get() {
+				log::info!("BOS Validators : Pallet paused, not executing offchain worker!");
+				return
+			}
 
-	// 			let decoded_config = network_config.get::<BTCConfig>();
-	// 			log::info!("BTC Pools : Decoded config is {:?}", decoded_config);
+			let mut lock = StorageLock::<Time>::new(BTC_OFFCHAIN_SIGNER_CONFIG_PREFIX);
+			if let Ok(_guard) = lock.try_lock() {
+				let network_config = StorageValueRef::persistent(BTC_OFFCHAIN_SIGNER_CONFIG_KEY);
 
-	// 			if let Err(_e) = decoded_config {
-	// 				log::info!("Error reading configuration, exiting offchain worker");
-	// 				return
-	// 			}
+				let decoded_config = network_config.get::<BTCConfig>();
+				log::info!("BTC Pools : Decoded config is {:?}", decoded_config);
 
-	// 			if let Ok(None) = decoded_config {
-	// 				log::info!("Configuration not found, exiting offchain worker");
-	// 				return
-	// 			}
+				if let Err(_e) = decoded_config {
+					log::info!("Error reading configuration, exiting offchain worker");
+					return
+				}
 
-	// 			if let Ok(Some(config)) = decoded_config {
-	// 				let now = block_number.try_into().map_or(0_u64, |f| f);
-	// 				log::info!("Current block: {:?}", block_number);
-	// 				if let Err(e) = Self::execute_tx_scan(now, config) {
-	// 					log::warn!(
-	//                         "BTC Pools : Offchain worker failed to execute at block {:?} with
-	// error : {:?}",                         now,
-	//                         e,
-	//                     )
-	// 				}
-	// 			}
-	// 		}
+				if let Ok(None) = decoded_config {
+					log::info!("Configuration not found, exiting offchain worker");
+					return
+				}
 
-	// 		log::info!("BTC Pools : OffchainWorker : End Execution");
-	// 	}
-	//}
+				if let Ok(Some(config)) = decoded_config {
+					let now = block_number.try_into().map_or(0_u64, |f| f);
+					log::info!("Current block: {:?}", block_number);
+					if let Err(e) = Self::execute_tx_scan(now, config) {
+						log::warn!(
+							"BTC Pools : Offchain worker failed to execute at block {:?} with
+	error : {:?}",
+							now,
+							e,
+						)
+					}
+				}
+			}
+
+			log::info!("BTC Pools : OffchainWorker : End Execution");
+		}
+	}
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {

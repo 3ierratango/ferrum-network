@@ -41,6 +41,37 @@ pub struct BTCClient {
 }
 
 impl BTCClient {
+	pub fn generate_pool_address_from_signers(validators: Vec<Vec<u8>>) -> Result<Vec<u8>, String> {
+		let secp = Secp256k1::new();
+
+		// ensure we can connect to BTC Client
+		let btc_client = Client::new("ssl://electrum.blockstream.info:60002")
+			.expect("Cannot establish connection to BTC Client!");
+
+		let taproot_scripts = Self::generate_taproot_scripts(validators);
+
+		let builder = TaprootBuilder::with_huffman_tree(vec![
+			(1, taproot_script[0].clone()),
+			(1, taproot_script[1].clone()),
+		])
+		.unwrap();
+		let tap_tree = TapTree::from_builder(builder).unwrap();
+		let pool_pub_key = XOnlyPublicKey::from_slice(&current_pool_address).unwrap();
+		let tap_info = tap_tree.into_builder().finalize(&secp, pool_pub_key).unwrap();
+		let merkle_root = tap_info.merkle_root();
+
+		let address = Address::p2tr(
+			&secp,
+			tap_info.internal_key(),
+			tap_info.merkle_root(),
+			bitcoin::Network::Testnet,
+		);
+
+		log::info!("BTC Pools : Taproot calculated address {:?}", address);
+
+		Ok(address)
+	}
+
 	pub fn generate_transaction_from_withdrawal_request(
 		recipient: Vec<u8>,
 		amount: u32,
@@ -53,10 +84,13 @@ impl BTCClient {
 		let btc_client = Client::new("ssl://electrum.blockstream.info:60002")
 			.expect("Cannot establish connection to BTC Client!");
 
-		let taproot_script = Self::generate_taproot_script(validators);
+		let taproot_scripts = Self::generate_taproot_scripts(validators);
 
-		let builder = TaprootBuilder::with_huffman_tree(vec![(1, taproot_script.clone())]).unwrap();
-
+		let builder = TaprootBuilder::with_huffman_tree(vec![
+			(1, taproot_script[0].clone()),
+			(1, taproot_script[1].clone()),
+		])
+		.unwrap();
 		let tap_tree = TapTree::from_builder(builder).unwrap();
 		let pool_pub_key = XOnlyPublicKey::from_slice(&current_pool_address).unwrap();
 		let tap_info = tap_tree.into_builder().finalize(&secp, pool_pub_key).unwrap();
@@ -118,8 +152,23 @@ impl BTCClient {
 		Ok(tx)
 	}
 
-	// TODO : Use an if-else script to handle threshold signature pallet failure
-	pub fn generate_taproot_script(validators: Vec<Vec<u8>>) -> Script {
+	pub fn generate_taproot_scripts(validators: Vec<Vec<u8>>) -> Vec<Script> {
+		// We create two scripts for taproot tree here
+
+		// 1. First branch, this has a requirement that the transaction is always signed by the
+		// threshold validator address, and in turn uses a lower threshold
+		let script_with_threshold_required =
+			generate_taproot_script_with_required_signer(validators.clone());
+
+		// 2. Second branch, this has a requirement that the transaction can be spend without
+		// the signature of the required validator, but with a higher threshold limit
+		let script_without_threshold_required =
+			generate_taproot_script_without_required_signer(validators.clone());
+
+		vec![script_with_threshold_required, script_without_threshold_required]
+	}
+
+	pub fn generate_taproot_script_with_required_signer(validators: Vec<Vec<u8>>) -> Script {
 		// we follow a simple approach here, the first validator is necessary, and the rest follow a
 		// threshold model
 		let mut wallet_script = Builder::new();
@@ -138,6 +187,37 @@ impl BTCClient {
 
 		// add keys with OP_CHECKSIG for all keys except last
 		for key in &mut x_pub_keys[1..threshold] {
+			wallet_script.clone().push_x_only_key(&key);
+			wallet_script.clone().push_opcode(all::OP_CHECKSIG);
+		}
+
+		// add the last key and threshold
+		wallet_script.clone().push_x_only_key(&x_pub_keys.last().unwrap());
+		wallet_script.clone().push_opcode(all::OP_CHECKSIGADD);
+		wallet_script.clone().push_int(threshold as i64);
+		wallet_script.clone().push_opcode(all::OP_GREATERTHANOREQUAL);
+
+		wallet_script.into_script()
+	}
+
+	pub fn generate_taproot_script_without_required_signer(validators: Vec<Vec<u8>>) -> Script {
+		// We create two scripts for taproot tree here
+		// we follow a simple approach here, the first validator is necessary, and the rest follow a
+		// threshold model
+		let mut wallet_script = Builder::new();
+
+		// convert all validators pub key to XOnlyPubKey format
+		let mut x_pub_keys = validators
+			.iter()
+			.map(|x| XOnlyPublicKey::from_slice(x).unwrap())
+			.collect::<Vec<_>>();
+
+		// calculate the threshold value
+		// since one key is required, the threshold would be the remaining keys - 1
+		let threshold = x_pub_keys.len() - 1;
+
+		// add keys with OP_CHECKSIG for all keys except last
+		for key in &mut x_pub_keys[0..threshold] {
 			wallet_script.clone().push_x_only_key(&key);
 			wallet_script.clone().push_opcode(all::OP_CHECKSIG);
 		}
@@ -210,9 +290,16 @@ impl BTCClient {
 
 		let validators = signatures.clone().into_iter().map(|x| x.0).collect::<Vec<_>>();
 
-		let taproot_script = Self::generate_taproot_script(validators);
+		let taproot_scripts = Self::generate_taproot_scripts(validators);
 
-		let builder = TaprootBuilder::with_huffman_tree(vec![(1, taproot_script.clone())]).unwrap();
+		let builder = TaprootBuilder::with_huffman_tree(vec![
+			(1, taproot_scripts[0].clone()),
+			(1, taproot_scripts[1].clone()),
+		])
+		.unwrap();
+
+		// this is the actual unlock script
+		let taproot_script = Self::generate_taproot_script_with_required_signer(validators);
 
 		let tap_tree = TapTree::from_builder(builder).unwrap();
 		let pool_pub_key = XOnlyPublicKey::from_slice(&current_pool_address.clone()).unwrap();

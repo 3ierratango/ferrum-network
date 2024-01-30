@@ -23,9 +23,9 @@ use curve25519_dalek::EdwardsPoint;
 use frost_secp256k1 as frost;
 use hex_literal::hex;
 use rand::thread_rng;
+use sp_io::offchain_index;
 use sp_runtime::DispatchResult;
 use sp_std::collections::BTreeMap;
-use sp_io::offchain_index;
 
 #[derive(Debug, Deserialize, Encode, Decode, Default)]
 struct IndexingData(Vec<u8>, u64);
@@ -33,41 +33,70 @@ struct IndexingData(Vec<u8>, u64);
 pub mod types;
 
 impl<T: Config> Pallet<T> {
+	/// Executes the offchain worker for threshold-based operations.
+	///
+	/// This function is responsible for managing various offchain tasks based on the
+	/// current state of the threshold-based key generation and signing process. It checks
+	/// the status of the pallet, the need for key generation, and the signing queue to
+	/// determine the appropriate actions to take.
+	///
+	/// # Parameters
+	///
+	/// - `block_number`: The current block number.
+	/// - `config`: Configuration parameters for the threshold-based operations.
+	///
+	/// # Errors
+	///
+	/// Returns `Ok(())` if the offchain worker executes successfully.
 	pub fn execute_threshold_offchain_worker(
 		block_number: u64,
 		config: types::ThresholdConfig,
 	) -> OffchainResult<()> {
-		//let current_pool_address = CurrentPoolAddress::<T>::get();
+		let pallet_paused = IsPalletPaused::<T>::get();
+		if pallet_paused {
+			log::info!(
+				"BOS Validators : Pallet paused, not executing all offchain worker functions!"
+			);
+		}
 
 		let current_pub_key = current_pub_key();
 
 		if current_pub_key.is_none() {
-			Self::initiate_keygen(config);
+			Self::initiate_keygen(config, true);
 		}
-		
-		// TODO : Rotation needs to be handled
-		// Sudo initiates the rotation
-		// Sudo finishes the rotation and this will replace the current pub key with new pub key
-		// The old pub key will remain until the new pub key is ready to be replace
-		// Rotation needs to handle the boston wallet
-		// --- Rotation process for boston wallet ----
-		// Who can initiate rotation? Should be manual and initiated by Governance
-		// 1. We need a pause function and unpause function, this will pause all boston related pallets, callable by admin role
-		// 2. We need an admin role, this account can pause/unpause the boston pallets
-		// 3. Admin can initiate the rotation, this create the new pub key, but not active
-		// 4. Governance request to switch to new pub key from old pub key, this should transfer all amount in old wallet to new wallet.
-		// 5. Set force origin as democracy for all boston pallets
-
-
-		Ok(())
+		// we need a new key to rotate
+		else if ExecuteNextPubKey::<T>::get() {
+			Self::initiate_keygen(config, false);
+		}
+		// something needs to be signed
+		// only execute if pallet is not paused
+		else if SigningQueue::<T>::get().is_some() && !pallet_paused {
+			Self::initiate_signing(config);
+		}
+		// finally check for emergency signing queue
+		// should execute even if pallet is paused
+		else if EmergencySigningQueue::<T>::get().is_some() {
+			Self::initiate_signing(config);
+		}
+		// even if paused we still allows signed transactions to be processed
+		else if PartialSignatures::<T>::get().is_some() {
+			Self::complete_signing(config);
+		} else {
+			return Ok(())
+		}
 	}
 
-	pub fn initiate_keygen(config: types::ThresholdConfig) -> DispatchResult {
+	pub fn initiate_keygen(config: types::ThresholdConfig, is_genesis: bool) -> DispatchResult {
 		// if we have all round 1 shares, start round 2
 		let round_1_shares = Round1Shares::<T>::iter().len();
 		let round_2_shares = Round2Shares::<T>::iter().len();
 
-		let required_key_threshold = CurrentQuorom::<T>::get().iter().count();
+		let required_key_threshold = if is_genesis {
+			CurrentQuorom::<T>::get().iter().count();
+		} else {
+			NextQuorom::<T>::get().iter().count();
+		};
+
 		if round_2_shares >= required_key_threshold {
 			keygen_complete(config);
 		} else if round_1_shares >= required_key_threshold {
@@ -77,20 +106,33 @@ impl<T: Config> Pallet<T> {
 		}
 	}
 
-	pub fn keygen_round_one(config: types::ThresholdConfig) -> DispatchResult {
-		let participants = CurrentQuorom::<T>::get();
-		let threshold = CurrentPoolThreshold::<T>::get();
+	/// Executes the first round of the distributed key generation (DKG) process.
+	///
+	/// This function handles the generation and distribution of Round 1 key shares among
+	/// participants. Each participant generates a secret package and a share of the key,
+	/// and these shares are stored in the blockchain storage. Additionally, the function
+	/// stores the participant's own Round 1 key share in offchain storage.
+	///
+	/// # Parameters
+	///
+	/// - `config`: Configuration parameters for the key generation process.
+	/// - `is_genesis`: A boolean indicating whether the key generation is for the current genesis.
+	///
+	/// # Errors
+	///
+	/// Returns `Ok(())` if the first round of the key generation process completes successfully.
+	pub fn keygen_round_one(config: types::ThresholdConfig, is_genesis: bool) -> DispatchResult {
+		let participants = if is_genesis {
+			CurrentQuorom::<T>::get();
+		} else {
+			NextQuorom::<T>::get();
+		};
 
-		// Ensure we have not already done round 1
-		let our_round_one = Round1Shares::<T>::get(
-			receiver_participant_identifier,
-			participant_identifier,
-			round1_package,
-		);
-
-		if our_round_one.is_some() {
-			return Ok(())
-		}
+		let threshold = if is_genesis {
+			CurrentPoolThreshold::<T>::get();
+		} else {
+			NextPoolThreshold::<T>::get();
+		};
 
 		let mut round1_secret_packages = BTreeMap::new();
 
@@ -104,6 +146,13 @@ impl<T: Config> Pallet<T> {
 		let participant_index = participants.find_by_index(caller).unwrap();
 		let participant_identifier = participant_index.try_into().expect("should be nonzero");
 
+		// Ensure we have not already done round 1
+		let our_round_one = Round1Shares::<T>::get(participant_identifier);
+
+		if our_round_one.is_some() {
+			return Ok(())
+		}
+
 		let (round1_secret_package, round1_package) = frost::keys::dkg::part1(
 			participant_identifier,
 			participants.len(),
@@ -115,60 +164,59 @@ impl<T: Config> Pallet<T> {
 		// In practice each participant will store it in their own environment.
 		round1_secret_packages.insert(participant_identifier, round1_secret_package);
 
-		// "Send" the round 1 package to all other participants.
-		for receiver_participant_index in 1..=participants.len() {
-			if receiver_participant_index == participant_index {
-				continue
-			}
-			let receiver_participant_identifier: frost::Identifier =
-				receiver_participant_index.try_into().expect("should be nonzero");
-
-			// push everyone shares to storage
-			// TODO : Does not have to be per participant since its on chain
-			Round1Shares::<T>::insert(
-				receiver_participant_identifier,
-				participant_identifier,
-				round1_package,
-			);
-		}
+		// push everyone shares to storage
+		Round1Shares::<T>::insert(participant_identifier, round1_package);
 
 		// save our round1 secret to offchain worker storage
-		let key = Self::derived_storage_key(frame_system::Module::<T>::block_number());
+		let key = Self::phase_one_storage_key();
 		let data = IndexingData(b"round_1_share".to_vec(), number);
 		offchain_index::set(&key, &data.encode());
+
+		// Emit an event.
+		Self::deposit_event(Event::Phase1ShareSubmitted { submitter: caller });
 
 		Ok(())
 	}
 
-	pub fn keygen_round_two(config: types::ThresholdConfig) -> DispatchResult {
-		let participants = CurrentQuorom::<T>::get();
-		let threshold = CurrentPoolThreshold::<T>::get();
+	/// Executes the second round of the distributed key generation (DKG) process.
+	///
+	/// This function handles the generation and distribution of Round 2 key shares among
+	/// participants. Each participant encrypts their Round 2 key share using the public key
+	/// of the receiving participant and submits the encrypted share to the storage. Additionally,
+	/// the function stores the participant's own Round 2 key share in offchain storage.
+	///
+	/// # Parameters
+	///
+	/// - `config`: Configuration parameters for the key generation process.
+	/// - `is_genesis`: A boolean indicating whether the key generation is for the current genesis.
+	///
+	/// # Errors
+	///
+	/// Returns `Ok(())` if the second round of the key generation process completes successfully.
+	pub fn keygen_round_two(config: types::ThresholdConfig, is_genesis: bool) -> DispatchResult {
+		let participants = if is_genesis {
+			CurrentQuorom::<T>::get();
+		} else {
+			NextQuorom::<T>::get();
+		};
+
+		let threshold = if is_genesis {
+			CurrentPoolThreshold::<T>::get();
+		} else {
+			NextPoolThreshold::<T>::get();
+		};
 
 		// Ensure we did not already complete round 2
-		let our_round_two = Round1Shares::<T>::get(
+		let our_round_two = Round2Shares::<T>::get(
 			receiver_participant_identifier,
-			participant_identifier,
-			round1_package,
+			receiver_participant_identifier,
 		);
 
 		if our_round_two.is_some() {
 			return Ok(())
 		}
 
-		// TODO : Ensure this key can be saved and restored
-		// TODO : Ensure this can be extracted via CLI
-		// TODO : Research starting the protocol from round2
-		// TODO : Cancel the keygen and start new, can be controlled by the admin role
-		// threshold -> [Alice, Bob, Charlie]
-		// admin needs to remove the faulty node
-		// pause should also stop the keygen process
-		// process to restore our secret share
 		let mut round2_secret_packages = BTreeMap::new();
-
-		// tool to query the quorom that checks availability of quorom members
-		// 
-		// threshold keygen -> [Alice, Bob, Charlie] 
-		// btc wallet => [threshold, x, y, z, a, b, c] 
 
 		////////////////////////////////////////////////////////////////////////////
 		// Key generation, Round 2
@@ -177,20 +225,17 @@ impl<T: Config> Pallet<T> {
 		let participant_identifier = participant_index.try_into().expect("should be nonzero");
 
 		// get all shares sent to us
-		let round_1_packages = Round1Shares::<T>::iter_prefix(participant_index);
+		let round_1_packages = Round1Shares::<T>::iter();
 
 		// get our round1 secret from offchain worker storage
-		// TODO : Use seperate keys
-		let storage_key = Self::derived_storage_key(frame_system::Module::<T>::block_number());
+		let storage_key = Self::phase_one_storage_key();
 		let data = IndexingData(b"round_1_share".to_vec(), number);
 		let round1_secret_package = offchain_index::get(&key);
 
-		let pub_key = Self::derived_signer_key(frame_system::Module::<T>::block_number());
+		let pub_key = Self::derived_signer_key();
 
-		// ANCHOR: dkg_part2
 		let (round2_secret_package, round2_packages) =
 			frost::keys::dkg::part2(round1_secret_package, round1_packages)?;
-		// ANCHOR_END: dkg_part2
 
 		// "Send" the round 2 package to all other participants.
 		for receiver_participant_index in 1..=participants.len() {
@@ -214,20 +259,48 @@ impl<T: Config> Pallet<T> {
 				.unwrap();
 
 			// push everyone shares to storage
-			Round2Shares::<T>::insert(receiver_participant_identifier, participant_identifier, tag);
+			Round2Shares::<T>::insert(
+				receiver_participant_identifier,
+				participant_identifier,
+				(nonce, tag),
+			);
+
+			// Emit an event.
+			Self::deposit_event(Event::Phase2ShareSubmitted {
+				submitter: participant_identifier,
+				recipient: receiver_participant_identifier,
+			});
 		}
 
 		// save our round2 secret to offchain worker storage
-		// TODO : Change to seperate key without dependency on block number
-		let key = Self::derived_storage_key(frame_system::Module::<T>::block_number());
+		let key = Self::phase_two_storage_key();
 		let data = IndexingData(b"round_2_share".to_vec(), number);
 		offchain_index::set(&key, &data.encode());
 
 		Ok(())
 	}
 
-	pub fn keygen_complete(config: types::ThresholdConfig) -> DispatchResult {
-		let participants = CurrentQuorom::<T>::get();
+	/// Completes the key generation process, producing the final public key.
+	///
+	/// This function handles the final steps of the distributed key generation (DKG) process,
+	/// aggregating the key shares received from participants in both Round 1 and Round 2. The
+	/// generated public key is then stored in the appropriate storage based on whether it is for
+	/// the current genesis or the next one.
+	///
+	/// # Parameters
+	///
+	/// - `config`: Configuration parameters for the key generation process.
+	/// - `is_genesis`: A boolean indicating whether the key generation is for the current genesis.
+	///
+	/// # Errors
+	///
+	/// Returns `Ok(())` if the key generation process completes successfully.
+	pub fn keygen_complete(config: types::ThresholdConfig, is_genesis: bool) -> DispatchResult {
+		let participants = if is_genesis {
+			CurrentQuorom::<T>::get();
+		} else {
+			NextQuorom::<T>::get();
+		};
 
 		// TODO : Move this to DB
 		let mut round2_secret_packages = BTreeMap::new();
@@ -239,46 +312,157 @@ impl<T: Config> Pallet<T> {
 		let participant_identifier = participant_index.try_into().expect("should be nonzero");
 
 		// get all shares sent to us
-		let round_1_packages = Round1Shares::<T>::iter_prefix(participant_index);
+		let round_1_packages = Round1Shares::<T>::iter();
 		let round_2_packages = Round2Shares::<T>::iter_prefix(participant_index);
 
 		// get our round2 secret to offchain worker storage
-		// KeygenID 
-		let storage_key = Self::derived_storage_key(frame_system::Module::<T>::block_number());
-		let pub_key_for_encryption = Self::derived_signer_key(frame_system::Module::<T>::block_number());
+		// KeygenID
+		let storage_key = Self::phase_two_storage_key();
+		let pub_key_for_encryption = Self::derived_signer_key();
 		let round1_secret_package = offchain_index::get(&storage_key);
 
 		for package in round_2_packages {
 			// decrypt key share
 			let secret_key = SecretKey::from(pub_key_for_encryption);
 			let public_key = PublicKey::from(receiver_participant_index);
-			// TODO : read from Storage, do not generate here
-			let nonce = GenericArray::from_slice(random_nonce());
 			let mut buffer = round_1_package.to_vec();
 
 			let round2_package = <Box>::new(&public_key, &secret_key)
-				.decrypt(nonce, round_2_packages, &mut buffer)
+				.decrypt(round_2_packages.0, round_2_packages.1, &mut buffer)
 				.unwrap();
-				round_2_packages.push(round2_package)
+			round_2_packages.push(round2_package)
 		}
-		
+
 		let (key_package, pubkey_package) =
 			frost::keys::dkg::part3(round2_secret_package, round1_packages, round2_packages)?;
 
 		// push the key to storage
-		CurrentPubKey::<T>::set(pubkey_package);
+		if is_genesis {
+			CurrentPubKey::<T>::set(pubkey_package);
+		} else {
+			NextPubKey::<T>::set(pubkey_package);
+		};
 
-		// TODO : Events needed here to see the status of the keygen process
+		Self::deposit_event(Event::KeygenCompleted { pub_key: pubkey_package.to_vec() });
 
 		Ok(())
 	}
 
-	pub fn derived_storage_key(block_number : BlockNumberFor<T>) -> Vec<u8> {
-		const ONCHAIN_TX_KEY: &[u8] = b"bos_validators::key";
-		let key : Vec<u8> = Default::default();
-		key.extend(ONCHAIN_TX_KEY);
-		key.extend(block_number.encode());
-		key
+	/// Initiates the signing process.
+	///
+	/// This function generates a partial signature for the data in the Emergency Signing Queue
+	/// and pushes it to the chain. The process involves creating a commitment share and signing
+	/// the message hash with the participant's key.
+	///
+	/// # Parameters
+	///
+	/// - `config`: Configuration parameters for the signing process.
+	///
+	/// # Errors
+	///
+	/// Returns `Ok(())` if the signing process completes successfully.
+	pub fn initiate_signing(config: types::ThresholdConfig) -> DispatchResult {
+		let data_to_sign = EmergencySigningQueue::<T>::get();
+
+		// initiate the round to all participants
+		let participants = CurrentQuorom::<T>::get();
+
+		let threshold = CurrentPoolThreshold::<T>::get();
+
+		let participant_index = participants.find_by_index(caller).unwrap();
+		let participant_identifier = participant_index.try_into().expect("should be nonzero");
+
+		let key = Self::phase_two_storage_key();
+		let data = IndexingData(b"round_2_share".to_vec(), number);
+		let pk_sk = offchain_index::get(&key, &data.encode());
+
+		// generate our partial signature and push to chain
+		let nonce = GenericArray::from_slice(random_nonce());
+		// first we generate our public keyshare
+		let (p1_public_comshares, mut p1_secret_comshares) =
+			frost::keys::dkg::generate_commitment_share_lists(nonce, &pk_sk, 1).unwrap();
+
+		// sign the actual message and create the partial sig
+		let message_hash = Secp256k1Sha256::h4(&data_to_sign[..]);
+		let partial_sig = pk_sk
+			.sign(
+				&message_hash,
+				0, // group key
+				&mut p1_secret_comshares,
+				0,
+				participants.iter().collect::<Vec<_>>(),
+			)
+			.unwrap();
+
+		PartialSignatures::<T>::push(participant_index, partial_sig);
+
+		Ok(())
+	}
+
+	/// Completes the signing process.
+	///
+	/// This function is responsible for aggregating partial signatures received from participants,
+	/// combining them into a final signature, and pushing the result to the Bos Pools pallet if
+	/// the threshold is reached.
+	///
+	/// # Parameters
+	///
+	/// - `config`: Configuration parameters for the signing process.
+	///
+	/// # Errors
+	///
+	/// Returns `Ok(())` if the signing process completes successfully. If the number of partial
+	/// signatures does not reach the required threshold, the function returns early without an
+	/// error.
+	pub fn complete_signing(config: types::ThresholdConfig) -> DispatchResult {
+		let partial_signatures = PartialSignatures::<T>::get().unwrap();
+
+		// initiate the round to all participants
+		let participants = CurrentQuorom::<T>::get();
+		let threshold = CurrentPoolThreshold::<T>::get();
+
+		// exit early if we do not have enough partial signatures
+		if partial_signatures.len() < threshold {
+			return Ok(())
+		}
+
+		let data_to_sign = EmergencySigningQueue::<T>::get();
+		let message_hash = Secp256k1Sha256::h4(&data_to_sign[..]);
+
+		// if we reached threshold, combine all partial signatures
+		let params = ThresholdParameters::new(participants.len(), threshold);
+		let mut aggregator = SignatureAggregator::new(params, 0, &message[..]);
+
+		for partial_sig in partial_signatures {
+			aggregator.include_partial_signature(&partial_sig);
+		}
+
+		let aggregator = aggregator.finalize().unwrap();
+		let final_signature = aggregator.aggregate().unwrap();
+
+		// clean partial signature storage so next data can be signed
+		PartialSignatures::<T>::clear();
+
+		// push the signature to the bos pools pallet if needed
+		// this is a hook, no need to wait for success
+		let _ = T::BosPoolsHandler::register_signature(message_hash, final_signature);
+
+		Ok(())
+	}
+
+	pub fn phase_one_storage_key() -> Vec<u8> {
+		const PHASE_ONE_KEY: &[u8] = b"bos_validators::key";
+		PHASE_ONE_KEY.to_vec()
+	}
+
+	pub fn phase_two_storage_key() -> Vec<u8> {
+		const PHASE_ONE_KEY: &[u8] = b"bos_validators::key";
+		PHASE_ONE_KEY.to_vec()
+	}
+
+	pub fn keyshare_storage_key() -> Vec<u8> {
+		const PHASE_ONE_KEY: &[u8] = b"bos_validators::key";
+		PHASE_ONE_KEY.to_vec()
 	}
 
 	pub fn derived_signer_key(block_number: BlockNumberFor<T>) -> Vec<u8> {
@@ -289,6 +473,6 @@ impl<T: Config> Pallet<T> {
 			)
 		}
 
-		return signer.raw_key();
+		return signer.raw_key()
 	}
 }

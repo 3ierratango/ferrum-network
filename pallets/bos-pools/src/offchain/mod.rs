@@ -29,6 +29,9 @@ impl<T: Config> Pallet<T> {
 		block_number: u64,
 		btc_config: types::BTCConfig,
 	) -> OffchainResult<()> {
+		// if the pallet is paused, we dont execute the offchain worker
+		let pallet_paused = IsPalletPaused::<T>::get();
+
 		// first handle any pending withdrawal requests
 		let pending_withdrawals = PendingWithdrawals::<T>::iter();
 		let pending_withdrawals = pending_withdrawals.collect::<Vec<_>>();
