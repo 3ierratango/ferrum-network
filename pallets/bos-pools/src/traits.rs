@@ -1,4 +1,5 @@
 use super::*;
+use sp_runtime::DispatchResult;
 
 /// Trait for handling signatures in the BosPools pallet.
 pub trait BosPoolsHandler {
@@ -15,7 +16,7 @@ pub trait BosPoolsHandler {
 	fn register_signature(message_hash: Vec<u8>, signature: Vec<u8>) -> DispatchResult;
 }
 
-impl BosPoolsHandler for crate::Pallet<T> {
+impl<T: Config> BosPoolsHandler for crate::Pallet<T> {
 	fn register_signature(message_hash: Vec<u8>, signature: Vec<u8>) -> DispatchResult {
 		// check if we have a message with the given message hash in our signing queue
 		// push the signature to storage
@@ -23,7 +24,10 @@ impl BosPoolsHandler for crate::Pallet<T> {
 			message_hash.clone(),
 			|details| -> Result<(), ()> {
 				let mut default = TransactionDetails::default();
+				// TODO : check if we already have a signature from the threshold validator pallet
+				// if it does then ignore
 				let mut signatures = &mut details.as_mut().unwrap_or(&mut default).signatures;
+				
 				signatures.insert(signer_address.to_vec(), signature.0.to_vec());
 
 				Self::deposit_event(Event::TransactionSignatureSubmitted {

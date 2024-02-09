@@ -47,8 +47,7 @@ use offchain::types::ThresholdConfig;
 )]
 pub struct TransactionDetails {
 	pub signatures: SignatureMap,
-	pub recipient: Vec<u8>,
-	pub amount: u32,
+	pub transaction: Vec<u8>,
 }
 
 #[derive(
@@ -108,6 +107,8 @@ pub mod pallet {
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 		// Pools handler trait
 		type BosPoolsHandler: BosPoolsHandler;
+		/// The identifier type for an offchain worker.
+		type AuthorityId: AppCrypto<Self::Public, Self::Signature>;
 		/// Type representing the weight of this pallet
 		type WeightInfo: WeightInfo;
 	}
@@ -320,6 +321,7 @@ pub mod pallet {
 			Ok(())
 		}
 
+		// TODO : Document all flows and the calls to make
 		#[pallet::call_index(7)]
 		#[pallet::weight(T::WeightInfo::do_something())]
 		pub fn switch_to_next_quorom_and_key(
@@ -338,5 +340,108 @@ pub mod pallet {
 
 			Ok(())
 		}
+
+		// Register a completed finalised signature
+		#[pallet::call_index(11)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn register_partial_signature(
+			origin: OriginFor<T>,
+			partial_signature: Vec<u8>
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			PartialSignatures::<T>::push(participant_index, partial_sig);
+
+			// if we have enough partial signatures, we combine them now
+			if Self::partial_signatures().len() > threshold {
+				let data_to_sign = EmergencySigningQueue::<T>::take();
+				let message_hash = Secp256k1Sha256::h4(&data_to_sign[..]);
+
+				// if we reached threshold, combine all partial signatures
+				let params = ThresholdParameters::new(participants.len(), threshold);
+				let mut aggregator = SignatureAggregator::new(params, 0, &message[..]);
+
+				for partial_sig in partial_signatures {
+					aggregator.include_partial_signature(&partial_sig);
+				}
+
+				// TODO : Remove unwrap, handle with proper error message
+				let aggregator = aggregator.finalize().unwrap();
+				let final_signature = aggregator.aggregate().unwrap();
+
+				let _ = T::BosPoolsHandler::register_signature(message_hash, final_signature);
+				PartialSignatures::<T>::clear();
+				return Ok(())
+			}
+			Ok(())
+		}
+
+		#[pallet::call_index(12)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn submit_round_one_shares(
+			origin: OriginFor<T>,
+			round1_package: Vec<u8>,
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+
+			// find the pariticipant index of submitter
+			let participant_index = Self::participants().find_by_index(caller).ok_or(Error::<T>::NotParticipant);
+			
+			// push everyone shares to storage
+			Round1Shares::<T>::insert(participant_identifier, round1_package);
+
+			// Emit an event.
+			Self::deposit_event(Event::Phase1ShareSubmitted { submitter: caller });
+
+			Ok(())
+		}
+
+		#[pallet::call_index(12)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn submit_round_two_shares(
+			origin: OriginFor<T>,
+			receiver_participant_identifier: u32,
+			round_2_share: (u32, Vec<u8>)
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+
+			// find the pariticipant index of submitter
+			let participant_index = Self::participants().find_by_index(caller).ok_or(Error::<T>::NotParticipant);
+			
+			// push everyone shares to storage
+			Round2Shares::<T>::insert(
+				receiver_participant_identifier,
+				participant_identifier,
+				(nonce, tag),
+			);
+
+			// Emit an event.
+			Self::deposit_event(Event::Phase2ShareSubmitted {
+				submitter: participant_identifier,
+				recipient: receiver_participant_identifier,
+			});
+
+			Ok(())
+		}
+
+		#[pallet::call_index(13)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn submit_keygen_complete(
+			origin: OriginFor<T>,
+			pubkey_package: Vec<u8>,
+			is_genesis: bool
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+
+			// push the key to storage
+		if is_genesis {
+			CurrentPubKey::<T>::set(pubkey_package);
+		} else {
+			NextPubKey::<T>::set(pubkey_package);
+		};
+
+			Self::deposit_event(Event::KeygenCompleted { pub_key: pubkey_package.to_vec() });
+			Ok(())
+		}
+
 	}
 }

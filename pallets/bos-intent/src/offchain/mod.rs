@@ -34,25 +34,54 @@ impl<T: Config> Pallet<T> {
 		let incoming_transactions =
 			btc_client::BTCClient::get_incoming_transactions(current_pool_address).unwrap();
 
-		// process the incoming transactions
-		let txids = Self::record_seen_transactions(incoming_transactions);
+		// remove any already processed transactions
+		let tx_ids = incoming_transactions.iter().filter(
+			|x| !ProcessedTransactions::<T>::get().contains(x)
+		).collect();
 
 		// push transactions to evm
 		evm_client::handle_new_incoming_transaction(txids);
-		
+
+		// process the incoming transactions
+		let txids = Self::record_seen_transactions(txids);
+
 		Ok(())
 	}
 
-	pub fn record_seen_transactions(incoming: ListReceivedByAddressResult) -> Vec<Txid> {
+	pub fn record_seen_transactions(successful: Vec<Vec<u8>>) -> DispatchResult {
 		let mut new_tx_ids = vec![];
 		// record all tx_ids to pallet storage
-		for txid in incoming.txids {
-			if ProcessedTransactions::<T>::get(txid.to_vec()).is_none() {
-				ProcessedTransactions::<T>::insert::<Vec<u8>, Vec<u8>>(txid.to_vec(), vec![]);
-				new_tx_ids.push(txid)
-			}
+
+		// sign transaction using our key
+		let signature = signer.sign(&sighash_sig).expect("Signing Failed!!");
+
+		let signer = Signer::<T, T::AuthorityId>::all_accounts();
+		if !signer.can_sign() {
+			return Err(
+				"No local accounts available. Consider adding one via `author_insertKey` RPC.",
+			)
 		}
 
-		new_tx_ids
+		let results = signer.send_signed_transaction(|_account| {
+			Call::ext_record_seen_transactions {
+				transactions: successful.clone()
+			};
+
+			for (acc, res) in &results {
+				match res {
+					Ok(()) => log::info!(
+						"[{:?}] Submitted submit_transaction_signature",
+						details.tx_data
+					),
+					Err(e) => log::error!(
+						"[{:?}] Failed to submit submit_transaction_signature: {:?}",
+						details.tx_data,
+						e
+					),
+				}
+			}
+		});
+
+		Ok(())
 	}
 }

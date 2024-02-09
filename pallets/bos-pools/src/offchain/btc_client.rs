@@ -28,12 +28,13 @@ use bitcoin::{
 };
 use electrum_client::{Client, ElectrumApi, ListUnspentRes};
 use ferrum_primitives::BTC_OFFCHAIN_SIGNER_KEY_TYPE;
+use frame_system::offchain::Signer;
 use reqwest;
 use sp_core::{ed25519, sr25519, ByteArray, Pair, Public, H256};
 use sp_io::crypto::{ecdsa_generate, ecdsa_sign_prehashed, sr25519_generate, sr25519_sign};
 use sp_std::str::FromStr;
 
-const MAX_PERMITTED_FEE_IN_SATS: u64 = 1000;
+const MAX_PERMITTED_FEE_IN_SATS: u64 = 100_000;
 
 #[derive(Debug, Clone)]
 pub struct BTCClient {
@@ -50,18 +51,18 @@ impl BTCClient {
 		let secp = Secp256k1::new();
 
 		// ensure we can connect to BTC Client
-		let btc_client = Client::new("ssl://electrum.blockstream.info:60002")
-			.expect("Cannot establish connection to BTC Client!");
+		let btc_client =
+			Client::new(self.http_api.clone()).expect("Cannot establish connection to BTC Client!");
 
 		let taproot_scripts = Self::generate_taproot_scripts(validators);
 
 		let builder = TaprootBuilder::with_huffman_tree(vec![
-			(1, taproot_script[0].clone()),
-			(1, taproot_script[1].clone()),
+			(1, taproot_scripts[0].clone()),
+			(1, taproot_scripts[1].clone()),
 		])
 		.unwrap();
 		let tap_tree = TapTree::from_builder(builder).unwrap();
-		let pool_pub_key = XOnlyPublicKey::from_slice(&current_pool_address).unwrap();
+		let pool_pub_key = XOnlyPublicKey::from_slice(&[0; 32]).unwrap();
 		let tap_info = tap_tree.into_builder().finalize(&secp, pool_pub_key).unwrap();
 		let merkle_root = tap_info.merkle_root();
 
@@ -109,10 +110,7 @@ impl BTCClient {
 	/// - The calculated fees are logged, and the function returns the constructed transaction on
 	///   success.
 	pub fn generate_transaction_from_withdrawal_request(
-		recipient: Vec<u8>,
-		amount: u32,
-		validators: Vec<Vec<u8>>,
-		current_pool_address: Vec<u8>,
+		details: WithdrawalRequest,
 	) -> Result<Transaction, String> {
 		let secp = Secp256k1::new();
 
@@ -123,12 +121,12 @@ impl BTCClient {
 		let taproot_scripts = Self::generate_taproot_scripts(validators);
 
 		let builder = TaprootBuilder::with_huffman_tree(vec![
-			(1, taproot_script[0].clone()),
-			(1, taproot_script[1].clone()),
+			(1, taproot_scripts[0].clone()),
+			(1, taproot_scripts[1].clone()),
 		])
 		.unwrap();
 		let tap_tree = TapTree::from_builder(builder).unwrap();
-		let pool_pub_key = XOnlyPublicKey::from_slice(&current_pool_address).unwrap();
+		let pool_pub_key = XOnlyPublicKey::from_slice(&[0u8; 32]).unwrap();
 		let tap_info = tap_tree.into_builder().finalize(&secp, pool_pub_key).unwrap();
 		let merkle_root = tap_info.merkle_root();
 
@@ -139,25 +137,26 @@ impl BTCClient {
 			bitcoin::Network::Testnet,
 		);
 
-		log::info!(
-			"BTC Pools : Taproot calculated address {:?} | Actual pool address {:?}",
-			address,
-			current_pool_address
-		);
+		log::info!("BTC Pools : Taproot calculated address {:?}", address,);
 
-		let utxos = Self::fetch_utxos(address);
+		// if a previous transaction exists then we use those utxos, else we fetch new ones,
+		// this will be triggered when we are retrying a transaction
+		let mut utxos: Vec<Utxo> = Default::default();
+		if Some(transaction) = details.get_latest_transaction() {
+			utxos = transaction.candidate_utxos;
+		} else {
+			utxos = Self::fetch_utxos(address);
+		}
 
 		let tx_ins = Self::filter_needed_utxos(amount.into(), utxos);
 
 		let recipient_address = String::from_utf8(recipient).expect("Found invalid UTF-8");
-		let current_pool_address =
-			String::from_utf8(current_pool_address).expect("Found invalid UTF-8");
+		let current_pool_address = String::from_utf8(address).expect("Found invalid UTF-8");
 
 		let mut tx = Transaction {
 			version: 2,
 			lock_time: bitcoin::PackedLockTime(0),
 			input: tx_ins
-				.0
 				.iter()
 				.map(|tx| TxIn {
 					previous_output: tx.previous_output.clone(),
@@ -183,9 +182,92 @@ impl BTCClient {
 		let base_fees = Self::get_network_recommended_fee().unwrap();
 		let total_fees = base_fees * tx.get_size() as u64;
 
+		// account for fees in the change transaction
+		tx.output[1].value = tx.output[1].value - total_fees;
+
 		log::info!("BTC Pools : Calculated Fees {:?}", total_fees);
 
-		Ok(tx)
+		let transaction_details = TransactionDetails {
+			signatures: Default::default(),
+			tx_id: None,
+			tx_data: tx.encode(),
+			fees: total_fees,
+			candidate_utxos: Some(utxos),
+			consumed_utxos: Some(tx_ins),
+			prev_tx_hash: None,                           // this is our first transaction
+			timeout_block: current_block_number + 24_u32, // 4hour timeout
+			created_block: current_block_number,
+		};
+
+		Ok(transaction_details)
+	}
+
+	pub fn validate_tx_data_from_transaction_details(
+		details: TransactionDetails,
+	) -> Result<Transaction, String> {
+		let validators = CurrentValidators::<T>::get();
+
+		if validators.is_empty() {
+			panic!("No BTC validators found!");
+		}
+
+		let taproot_scripts = Self::generate_taproot_scripts(validators);
+
+		let builder = TaprootBuilder::with_huffman_tree(vec![
+			(1, taproot_scripts[0].clone()),
+			(1, taproot_scripts[1].clone()),
+		])
+		.unwrap();
+
+		let tap_tree = TapTree::from_builder(builder).unwrap();
+		let pool_pub_key = XOnlyPublicKey::from_slice(&[0u8; 32]).unwrap();
+		let tap_info = tap_tree.into_builder().finalize(&secp, pool_pub_key).unwrap();
+		let merkle_root = tap_info.merkle_root();
+		let tx_ins = details.consumed_utxos;
+
+		let address = Address::p2tr(
+			&secp,
+			tap_info.internal_key(),
+			tap_info.merkle_root(),
+			bitcoin::Network::Testnet,
+		);
+
+		let recipient_address = details.recipient;
+		let current_pool_address = String::from_utf8(address).expect("Found invalid UTF-8");
+
+		let recipient_address = String::from_utf8(recipient).expect("Found invalid UTF-8");
+		let current_pool_address = String::from_utf8(address).expect("Found invalid UTF-8");
+
+		let mut tx = Transaction {
+			version: 2,
+			lock_time: bitcoin::PackedLockTime(0),
+			input: tx_ins
+				.iter()
+				.map(|tx| TxIn {
+					previous_output: tx.previous_output.clone(),
+					script_sig: Script::new(),
+					sequence: bitcoin::Sequence(0xFFFFFFFF),
+					witness: Witness::default(),
+				})
+				.collect::<Vec<_>>(),
+			output: vec![
+				TxOut {
+					value: amount.into(),
+					script_pubkey: Address::from_str(&recipient_address).unwrap().script_pubkey(),
+				},
+				TxOut {
+					value: tx_ins.1 - amount as u64 - details.fees,
+					script_pubkey: Address::from_str(&current_pool_address)
+						.unwrap()
+						.script_pubkey(),
+				},
+			],
+		};
+
+		// lets generate the hash and ensure it matches
+		ensure!(tx.to_vec() == details.to_vec(), Error::<T>::TransactionValidationFailed);
+
+		Ok(());
 	}
 
 	pub fn generate_taproot_scripts(validators: Vec<Vec<u8>>) -> Vec<Script> {
@@ -194,12 +276,12 @@ impl BTCClient {
 		// 1. First branch, this has a requirement that the transaction is always signed by the
 		// threshold validator address, and in turn uses a lower threshold
 		let script_with_threshold_required =
-			generate_taproot_script_with_required_signer(validators.clone());
+			Self::generate_taproot_script_with_required_signer(validators.clone());
 
 		// 2. Second branch, this has a requirement that the transaction can be spend without
 		// the signature of the required validator, but with a higher threshold limit
 		let script_without_threshold_required =
-			generate_taproot_script_without_required_signer(validators.clone());
+			Self::generate_taproot_script_without_required_signer(validators.clone());
 
 		vec![script_with_threshold_required, script_without_threshold_required]
 	}
@@ -296,13 +378,23 @@ impl BTCClient {
 		wallet_script.into_script()
 	}
 
+	// TODO : Should wait for prev transaction to be broadcasted
 	pub fn fetch_utxos(address: Address) -> Vec<ListUnspentRes> {
 		let client = Client::new("ssl://electrum.blockstream.info:60002").unwrap();
-		let vec_tx_in = client.script_list_unspent(&address.script_pubkey()).unwrap();
+		let tx_status = client.script_list_unspent(&address.script_pubkey()).unwrap();
 
 		println!("Found UTXOS {:?}", vec_tx_in);
 
 		vec_tx_in
+	}
+
+	pub fn check_txid_success(tx_id: Vec<u8>) -> bool {
+		let client = Client::new("ssl://electrum.blockstream.info:60002").unwrap();
+		let status = client.get_transaction_status(&tx_id).unwrap();
+
+		println!("Found Status {:?}", status);
+
+		status.confirmed
 	}
 
 	/// Filter and select the needed UTXOs (Unspent Transaction Outputs) to cover the specified
@@ -375,21 +467,14 @@ impl BTCClient {
 	///
 	/// Returns a `Result` containing the transaction ID (`Txid`) if the broadcast is successful, or
 	/// an error message as a `String` in case of failure.
-	pub fn broadcast_completed_transaction(
-		transaction: Vec<u8>,
-		recipient: Vec<u8>,
-		amount: u32,
-		signatures: SignatureMap,
-		current_pool_address: Vec<u8>,
-	) -> Result<Txid, String> {
-		let secp = Secp256k1::new();
-
+	pub fn broadcast_completed_transaction(details: TransactionDetails) -> Result<Txid, String> {
 		// ensure we can connect to BTC Client
-		let btc_client = Client::new("ssl://electrum.blockstream.info:60002")
-			.expect("Cannot establish connection to BTC Client!");
+		let btc_client =
+			Client::new(self.http_api.clone()).expect("Cannot establish connection to BTC Client!");
 
 		let validators = signatures.clone().into_iter().map(|x| x.0).collect::<Vec<_>>();
 
+		// == regenerate the transaction from details ===
 		let taproot_scripts = Self::generate_taproot_scripts(validators);
 
 		let builder = TaprootBuilder::with_huffman_tree(vec![
@@ -398,13 +483,11 @@ impl BTCClient {
 		])
 		.unwrap();
 
-		// this is the actual unlock script
-		let taproot_script = Self::generate_taproot_script_with_required_signer(validators);
-
 		let tap_tree = TapTree::from_builder(builder).unwrap();
-		let pool_pub_key = XOnlyPublicKey::from_slice(&current_pool_address.clone()).unwrap();
+		let pool_pub_key = XOnlyPublicKey::from_slice(&[0u8; 32]).unwrap();
 		let tap_info = tap_tree.into_builder().finalize(&secp, pool_pub_key).unwrap();
 		let merkle_root = tap_info.merkle_root();
+		let tx_ins = details.consumed_utxos;
 
 		let address = Address::p2tr(
 			&secp,
@@ -413,25 +496,16 @@ impl BTCClient {
 			bitcoin::Network::Testnet,
 		);
 
-		log::info!(
-			"BTC Pools : Taproot calculated address {:?} | Actual pool address {:?}",
-			address,
-			current_pool_address
-		);
-
-		let utxos = Self::fetch_utxos(address);
-
-		let tx_ins = Self::filter_needed_utxos(amount.into(), utxos);
+		let recipient_address = details.recipient;
+		let current_pool_address = String::from_utf8(address).expect("Found invalid UTF-8");
 
 		let recipient_address = String::from_utf8(recipient).expect("Found invalid UTF-8");
-		let current_pool_address =
-			String::from_utf8(current_pool_address).expect("Found invalid UTF-8");
+		let current_pool_address = String::from_utf8(address).expect("Found invalid UTF-8");
 
 		let mut tx = Transaction {
 			version: 2,
 			lock_time: bitcoin::PackedLockTime(0),
 			input: tx_ins
-				.0
 				.iter()
 				.map(|tx| TxIn {
 					previous_output: tx.previous_output.clone(),
@@ -446,13 +520,16 @@ impl BTCClient {
 					script_pubkey: Address::from_str(&recipient_address).unwrap().script_pubkey(),
 				},
 				TxOut {
-					value: tx_ins.1 - amount as u64,
+					value: tx_ins.1 - amount as u64 - details.fees,
 					script_pubkey: Address::from_str(&current_pool_address)
 						.unwrap()
 						.script_pubkey(),
 				},
 			],
 		};
+
+		// lets generate the hash and ensure it matches
+		ensure!(tx.to_vec() == details.to_vec(), Error::<T>::TransactionValidationFailed);
 
 		let prev_tx = tx
 			.clone()
@@ -464,40 +541,47 @@ impl BTCClient {
 		let tx_out_of_prev_tx =
 			prev_tx.clone().iter().map(|tx| tx.output[0].clone()).collect::<Vec<TxOut>>();
 
-		let binding = tx_out_of_prev_tx;
-		let prevouts = Prevouts::All(&binding);
-
-		let sighash_sig = SighashCache::new(&mut tx.clone())
-			.taproot_script_spend_signature_hash(
-				0,
-				&prevouts,
-				ScriptPath::with_defaults(&taproot_script),
-				SchnorrSighashType::Default,
-			)
-			.unwrap();
+		let prevouts = Prevouts::All(&transaction.consumed_utxos);
+		let wallet_script =
+			BTCClient::generate_taproot_script_with_required_signer(CurrentValidators::<T>::get());
 
 		let key_sig = SighashCache::new(&mut tx.clone())
 			.taproot_key_spend_signature_hash(0, &prevouts, SchnorrSighashType::Default)
 			.unwrap();
 
 		let actual_control = tap_info
-			.control_block(&(taproot_script.clone(), LeafVersion::TapScript))
+			.control_block(&(wallet_script.clone(), LeafVersion::TapScript))
 			.unwrap();
 
 		let mut witnesses = vec![];
 
-		// TODO : We need to add more checks here to ensure the sigs match the stack, the order is
-		// not always guaranteed The order is maintained via the insertion but should check again to
-		// be sure (it's a stack, so this is Last In First Out, and will be consumed by the first
-		// CHECKSIGVERIFY)
-		for signature in signatures {
+		// we need to insert the witness signatures in order
+		// for this we arrange the signature map in the same order as the expected validator order
+		let current_validators = CurrentValidators::<T>::get();
+		let mut ordered_signatures = Vec::with_capacity(current_validators.iter().len());
+
+		for (pos, validator_account) in current_validators.iter().enumerate() {
+			let signature = signatures.get(validator_account);
+
+			// if the validator has signed, then insert the signature in expected position
+			if let Some(signature) = signature {
+				ordered_signatures.insert(pos, signature);
+			}
+			// this means this validator has not signed, in this case we insert an empty vector
+			else {
+				ordered_signatures.insert(pos, vec![]);
+			}
+		}
+
+		// here we loop in reverse since we are inserting to a stack, FIFO
+		for signature in ordered_signatures.iter().rev() {
 			witnesses.push(
 				SchnorrSig {
 					sig: secp256k1::schnorr::Signature::from_slice(&signature.1).unwrap(),
 					hash_ty: SchnorrSighashType::Default,
 				}
 				.to_vec(),
-			)
+			);
 		}
 
 		witnesses.push(taproot_script.to_bytes());
@@ -540,6 +624,47 @@ impl BTCClient {
 		// Make the HTTP GET request
 		let response: MempoolFees = reqwest::blocking::get(api_url).unwrap().json().unwrap();
 		return Ok(response.regular)
+	}
+
+	fn is_transaction_successful(tx_id: Vec<u8>) -> bool {
+		// ensure we can connect to BTC Client
+		let btc_client =
+			Client::new(self.http_api.clone()).expect("Cannot establish connection to BTC Client!");
+
+		#[derive(serde::Serialize, serde::Deserialize)]
+		struct TransactionGetResponse {
+			blockhash: BlockHash,
+			blocktime: u64,
+			confirmations: u64,
+			hash: Vec<u8>,
+			hex: Vec<u8>,
+			locktime: u64,
+			size: u64,
+			time: u64,
+			txid: Vec<u8>,
+			version: u8,
+			vin: Vec<TxIn>,
+			vout: Vec<TxOut>,
+		};
+
+		// refer https://electrumx-spesmilo.readthedocs.io/en/latest/protocol-methods.html#blockchain-transaction-get
+		// always set verbose = true, else json serialisation fails
+		let transaction_status = btc_client.transaction_get(&tx_id, true);
+
+		match transaction_status {
+			Ok(res) => {
+				let transaction_status: TransactionGetResponse =
+					transaction_status.unwrap().json().unwrap();
+				// we require atleast 3 confirmations
+				return transaction_status.confirmations > 3
+			},
+			Err(e) => {
+				log::info!("Transaction success check failed with error {:?}", e);
+				// we dont want to fail here since the api may return error if transaction is not
+				// picked up
+				return false
+			},
+		}
 	}
 }
 

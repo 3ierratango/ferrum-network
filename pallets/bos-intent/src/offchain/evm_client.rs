@@ -37,29 +37,31 @@ use sp_std::{
 pub struct EvmClient;
 
 impl EvmClient {
-	fn handle_new_incoming_transaction(txids: Vec<Txid>) {
+	fn handle_new_incoming_transaction(txids: Vec<Txid>) -> Vec<Txid> {
 		// read all intents on chain
 		let rpc_endpoint = "http://127.0.0.1:8545"; // local ferrum node
+		let successfully_processed : Vec<Txid> = Default::default();
 
 		let intent_contract_address =
-			ChainUtils::hex_to_address(b"c1F13fde5fFDE7B7ae6C95C9190d038A2eEb9e29");
+			ChainUtils::hex_to_address(b"c1F13fde5fFDE7B7ae6C95C9190d038A2eEb9e29"); // TODO : Read from config
 		let client = ContractClient::new(rpc_endpoint.into(), &intent_contract_address, 26100);
 		let intents = client.get_registered_intents().unwrap();
 
 		// lets decode all btc transactionids
-		let transactions: Vec<(u64, Address)> = vec![];
+		let transactions: BTreeMap<(u64, Address), TxId> = Default::default();
 
 		for txid in txids {
+			// read the sender from the transaction
 			let tx = BTCClient::get_transaction_details(current_pool_address).unwrap();
 			let sender = BTCClient::extract_public_key_from_script(
-				&tx.input[0].script_sig.as_bytes().to_vec(),
+				&tx.vin[0].script_sig.as_bytes().to_vec(),
 			);
-			transactions.push((tx.output[0].value, sender));
+			transactions.insert(txid, (tx.output[0].value, sender));
 		}
 
 		// search if any intents have sent tx
 		for intent in intents {
-			if transactions.contains((intent.btc_amount, intent.btc_address)) {
+			if let Some(tx_id) = transactions.get((intent.btc_amount, intent.btc_address)) {
 				// send call to execute intent
 				let inputs = [Token::Uint(U256::from(intent.id))];
 
@@ -78,8 +80,14 @@ impl EvmClient {
 					&client.signer,
 					recipient_address,
 				)?;
+
+				if res.is_ok() {
+					successfully_processed.push(txid)
+				}
 			}
 		}
+
+		return successfully_processed;
 	}
 }
 

@@ -19,10 +19,22 @@ use electrum_client::{Client, ElectrumApi};
 use sp_runtime::traits::Zero;
 pub mod types;
 use crate::offchain::btc_client::BTCClientSignature;
+use frame_system::offchain::Signer;
 use sp_core::sr25519;
 pub use types::*;
 
 mod btc_client;
+use btc_client::BTCClient;
+
+// if timeout and tx not accepted, then retry
+// 1. Withdrawal
+// 2. Check Pending Transaction (not timed out)
+// 3. Sign the pending tansaction
+// 4. Create a new if not exists
+// 3. Check (tx is submitted or timeout > now)
+// 4. New Pending Transactin (only diff is fee amount, ensure we have same utxo)
+// 5. Resign
+// 6.
 
 impl<T: Config> Pallet<T> {
 	/// Execute the offchain worker for BTC Pools.
@@ -57,36 +69,25 @@ impl<T: Config> Pallet<T> {
 		// if the pallet is paused, we dont execute the offchain worker
 		let pallet_paused = IsPalletPaused::<T>::get();
 
+		if pallet_paused {
+			log::info!("BTC Pools : Pallet is paused");
+			return Ok(())
+		}
+
 		// first handle any pending withdrawal requests
-		let pending_withdrawals = PendingWithdrawals::<T>::iter();
-		let pending_withdrawals = pending_withdrawals.collect::<Vec<_>>();
+		let pending_withdrawal = PendingWithdrawals::<T>::iter().first();
 
 		log::info!("BTC Pools : Pending withdrawals is {:?}", pending_withdrawals);
-
-		for (recipient, amount) in pending_withdrawals {
-			let result = Self::handle_withdrawal_request(recipient.clone(), amount);
-			log::info!(
-				"BTC Pools : Withdrawal request for recipient : {:?}, processed {:?}",
-				recipient,
-				result
-			);
+		if pending_withdrawal.is_none() {
+			return Ok(())
 		}
 
-		// check for any pending transactions
-		let pending_transactions = PendingTransactions::<T>::iter();
-		let pending_transactions = pending_transactions.collect::<Vec<_>>();
-
-		log::info!("BTC Pools : Pending transactions is {:?}", pending_transactions);
-
-		for (hash, details) in pending_transactions {
-			let result =
-				Self::handle_pending_transaction(hash.clone(), details, btc_config.clone());
-			log::info!(
-				"BTC Pools : Pending transaction for hash : {:?}, processed {:?}",
-				hash,
-				result
-			);
-		}
+		let result = Self::handle_withdrawal_request(pending_withdrawal.unwrap(), btc_config);
+		log::info!(
+			"BTC Pools : Withdrawal request for recipient : {:?}, processed {:?}",
+			recipient,
+			result
+		);
 
 		Ok(())
 	}
@@ -117,35 +118,112 @@ impl<T: Config> Pallet<T> {
 	///   information.
 	/// - If no BTC validators are found, the function panics with the message "No BTC validators
 	///   found!"
-	pub fn handle_withdrawal_request(recipient: Vec<u8>, amount: u32) -> OffchainResult<()> {
-		// TODO : We should have some queue here, now everyone tries to submit and only first one
-		// works let prepare a transaction for this withdrawal request
-		let current_pool_address = CurrentPoolAddress::<T>::get();
+	pub fn handle_withdrawal_request(
+		pending_withdrawal: WithdrawalRequest<T>,
+		btc_config: types::BTCConfig,
+	) -> OffchainResult<()> {
+		// handle depending on the stage of the withdrawal
+		match pending_withdrawal.status {
+			New => Self::handle_new_withdrawal_request(pending_withdrawal, btc_config),
+			TransactionCreated => Self::handle_transaction_sign(pending_withdrawal, btc_config),
+			TransactionSigned => Self::handle_transaction_broadcast(pending_withdrawal, btc_config),
+			AwaitingConfirmation => Self::handle_transaction_retry(pending_withdrawal, btc_config),
+			TransactionRetry => Self::handle_transaction_retry(pending_withdrawal, btc_config),
+		}
+	}
 
+	pub fn handle_new_withdrawal_request(
+		details: WithdrawalRequest<T>,
+		btc_config: types::BTCConfig,
+	) -> OffchainResult<()> {
 		// pick all the known validators
-		let validators = RegisteredValidators::<T>::iter();
-		let validators = validators.map(|x| x.1).collect::<Vec<_>>();
+		let validators = CurrentValidators::<T>::get();
 
 		if validators.is_empty() {
 			panic!("No BTC validators found!");
 		}
 
-		let transaction = btc_client::BTCClient::generate_transaction_from_withdrawal_request(
-			recipient,
-			amount,
-			validators,
-			current_pool_address,
-		)
-		.unwrap()
-		.txid()
-		.as_ref()
-		.to_vec();
+		let now = <T as frame_system::Config>::block_number();
 
-		// push transaction to storage
-		PendingTransactions::<T>::insert::<Vec<u8>, TransactionDetails>(
-			transaction,
-			Default::default(),
-		);
+		let transaction =
+			btc_client::BTCClient::generate_transaction_from_withdrawal_request(details)
+				.unwrap()
+				.txid()
+				.as_ref()
+				.to_vec();
+
+		let signer = Signer::<T, T::AuthorityId>::all_accounts();
+		if !signer.can_sign() {
+			return Err(
+				"No local accounts available. Consider adding one via `author_insertKey` RPC.",
+			)
+		}
+
+		
+		let results = signer.send_signed_transaction(|_account| {
+			
+			Call::submit_transaction {
+				address: details.address,
+				amount: details.address,
+				transaction,
+			}
+		});
+
+		for (acc, res) in &results {
+			match res {
+				Ok(()) => log::info!("[{:?}] Submitted submit_transaction request", res),
+				Err(e) =>
+					log::error!("[{:?}] Failed to submit submit_transaction request: {:?}", res, e),
+			}
+		}
+
+		Ok(())
+	}
+
+	pub fn handle_transaction_retry(
+		details: WithdrawalRequest<T>,
+		btc_config: types::BTCConfig,
+	) -> OffchainResult<()> {
+		// pick all the known validators
+		let validators = CurrentValidators::<T>::get();
+
+		if validators.is_empty() {
+			panic!("No BTC validators found!");
+		}
+
+		let now = <T as frame_system::Config>::block_number();
+
+		let transaction =
+			btc_client::BTCClient::generate_transaction_from_withdrawal_request(details)
+				.unwrap()
+				.txid()
+				.as_ref()
+				.to_vec();
+
+		let signer = Signer::<T, T::AuthorityId>::all_accounts();
+		if !signer.can_sign() {
+			return Err(
+				"No local accounts available. Consider adding one via `author_insertKey` RPC.",
+			)
+		}
+
+		
+		let results = signer.send_signed_transaction(|_account| {
+			
+			Call::submit_transaction {
+				address: details.address,
+				amount: details.address,
+				transaction,
+			}
+		});
+
+		for (acc, res) in &results {
+			match res {
+				Ok(()) => log::info!("[{:?}] Submitted submit_transaction request", res),
+				Err(e) =>
+					log::error!("[{:?}] Failed to submit submit_transaction request: {:?}", res, e),
+			}
+		}
 
 		Ok(())
 	}
@@ -177,13 +255,10 @@ impl<T: Config> Pallet<T> {
 	///   considered processed, and an event is emitted.
 	/// - The `CurrentPoolAddress` and `CurrentPoolThreshold` storages are used to gather necessary
 	///   information.
-	pub fn handle_pending_transaction(
-		hash: Vec<u8>,
-		details: TransactionDetails,
+	pub fn handle_transaction_sign(
+		details: WithdrawalRequest<T>,
 		btc_config: types::BTCConfig,
 	) -> OffchainResult<()> {
-		let current_pool_address = CurrentPoolAddress::<T>::get();
-
 		let mut key = [0u8; 32];
 		key[..32].copy_from_slice(&btc_config.signer_public_key);
 		let signer_address = sr25519::Public(key);
@@ -191,49 +266,171 @@ impl<T: Config> Pallet<T> {
 
 		// if we have not already signed, sign the transaction
 		if details.signatures.get(&signer.from.to_vec()).is_none() {
-			// sign transaction using our key
-			// TODO : Reconstruct the transaction and ensure that hash is valid
-			let signature = signer.sign(&hash).expect("Signing Failed!!");
+			// let first validate the data to sign
+			let transaction = details.get_latest_transaction();
+			BTCClient::validate_tx_data_from_transaction_details(transaction)?;
 
-			// push the signature to storage
-			let _ =
-				PendingTransactions::<T>::try_mutate(hash.clone(), |details| -> Result<(), ()> {
-					let mut default = TransactionDetails::default();
-					let mut signatures = &mut details.as_mut().unwrap_or(&mut default).signatures;
-					signatures.insert(signer_address.to_vec(), signature.0.to_vec());
-
-					Self::deposit_event(Event::TransactionSignatureSubmitted {
-						hash: hash.clone(),
-						signature: signature.0.to_vec(),
-					});
-
-					// if above threshold, complete
-					if signatures.len() as u32 >= CurrentPoolThreshold::<T>::get() {
-						Self::deposit_event(Event::TransactionProcessed { hash });
-					}
-
-					Ok(())
-				});
-
-			return Ok(())
-		}
-		// if we have signed the transaction, if the threshold is reached, we broadcast to chain
-		else {
-			// TODO : We should have some queue here, now everyone tries to submit and only first
-			// one works
-			if details.signatures.len() as u32 >= CurrentPoolThreshold::<T>::get() {
-				// threshold reached, we can broadcast
-				let transaction = btc_client::BTCClient::broadcast_completed_transaction(
-					hash,
-					details.recipient,
-					details.amount,
-					details.signatures,
-					current_pool_address,
+			// generate the data to sign
+			let prevouts = Prevouts::All(&transaction.consumed_utxos);
+			let wallet_script = BTCClient::generate_taproot_script_with_required_signer(
+				CurrentValidators::<T>::get(),
+			);
+			let sighash_sig = SighashCache::new(&mut transaction.clone())
+				.taproot_script_spend_signature_hash(
+					0,
+					&prevouts,
+					ScriptPath::with_defaults(&wallet_script),
+					SchnorrSighashType::Default,
 				)
 				.unwrap();
+
+			// sign transaction using our key
+			let signature = signer.sign(&sighash_sig).expect("Signing Failed!!");
+
+			let signer = Signer::<T, T::AuthorityId>::all_accounts();
+			if !signer.can_sign() {
+				return Err(
+					"No local accounts available. Consider adding one via `author_insertKey` RPC.",
+				)
 			}
+
+			let results = signer.send_signed_transaction(|_account| {
+				Call::submit_transaction_signature {
+					address: details.address,
+					amount: details.amount,
+					signature,
+				};
+
+				for (acc, res) in &results {
+					match res {
+						Ok(()) => log::info!(
+							"[{:?}] Submitted submit_transaction_signature",
+							details.tx_data
+						),
+						Err(e) => log::error!(
+							"[{:?}] Failed to submit submit_transaction_signature: {:?}",
+							details.tx_data,
+							e
+						),
+					}
+				}
+			});
 		}
 
 		Ok(())
 	}
+}
+
+pub fn handle_transaction_broadcast(
+	details: WithdrawalRequest<T>,
+	btc_config: types::BTCConfig,
+) -> OffchainResult<()> {
+	// we use a simple round robin to determin if its our turn to submit
+	let current_validators = CurrentValidators::<T>::get().iter().len();
+	let current_block = <T as frame_system::Config>::block_number();
+	let selected_validator_index = *current_block % current_validators as u32;
+	let selected_validator = current_validators.get(selected_validator_index as usize);
+
+	// the signer does not have a method to read all available public keys, we instead sign
+	// a dummy message and read the current pub key from the signature.
+	let signer = Signer::<T, T::AuthorityId>::all_accounts();
+	if !signer.can_sign() {
+		return Err("No local accounts available. Consider adding one via `author_insertKey` RPC.")
+	}
+
+	let signature = signer.sign_message(b"test");
+	let account: &T::AccountId =
+		&signature.first().expect("Unable to retreive signed message").0.id; // the unwrap here is ok since we checked if can_sign() is true above
+
+	if account != &selected_validator {
+		log::debug!(
+			"handle_transaction_broadcast: Not our turn to broadcast, selected signer is {:?}",
+			selected_validator
+		);
+		return Ok(())
+	}
+
+	// its our turn, so setup signatures and broadcast
+	let tx_id =
+		BTCClient::broadcast_completed_transaction(details.get_latest_transaction().clone());
+
+	// post the transaction to update this data onchain
+	let results = signer.send_signed_transaction(|_account| {
+		Call::submit_transaction_broadcast_result {
+			address: details.address,
+			amount: details.amount,
+			tx_id,
+		};
+
+		for (acc, res) in &results {
+			match res {
+				Ok(()) =>
+					log::info!("[{:?}] Submitted submit_transaction_signature", details.tx_data),
+				Err(e) => log::error!(
+					"[{:?}] Failed to submit submit_transaction_signature: {:?}",
+					details.tx_data,
+					e
+				),
+			}
+		}
+	});
+
+	Ok(())
+}
+
+pub fn handle_transaction_retry(
+	details: WithdrawalRequest<T>,
+	btc_config: types::BTCConfig,
+) -> OffchainResult<()> {
+	// analyse the state of the latest transaction
+	let tx = details.get_latest_transaction();
+
+	let signer = Signer::<T, T::AuthorityId>::all_accounts();
+	if !signer.can_sign() {
+		return Err("No local accounts available. Consider adding one via `author_insertKey` RPC.")
+	}
+
+	// is the transaction success
+	if BTCClient::is_transaction_successful(tx.tx_id) {
+		// all good, only thing left to do is to mark the transaction as completed
+		// this should remove it from queue and then make way for next item in queue
+		let results = signer.send_signed_transaction(|_account| {
+			
+			Call::submit_transaction_broadcasted_result {
+				address: details.recipient,
+				amount: details.amount,
+			}
+		});
+
+		for (acc, res) in &results {
+			match res {
+				Ok(()) => log::info!("[{:?}] Submitted handle withdraw request", res),
+				Err(e) =>
+					log::error!("[{:?}] Failed to submit handle withdraw request: {:?}", res, e),
+			}
+		}
+
+		// completed, exit the function
+		return Ok(())
+	}
+
+	// if the transaction is timed out, then we mark it to retry
+	let current_block = <T as frame_system::Config>::block_number();
+	if tx.timeout_block < current_block {
+		let results =
+			signer.send_signed_transaction(|_account| Call::submit_transaction_for_retry {
+				address: details.recipient,
+				amount: details.amount,
+			});
+
+		for (acc, res) in &results {
+			match res {
+				Ok(()) => log::info!("[{:?}] Submitted handle withdraw request", res),
+				Err(e) =>
+					log::error!("[{:?}] Failed to submit handle withdraw request: {:?}", res, e),
+			}
+		}
+	}
+
+	Ok(())
 }

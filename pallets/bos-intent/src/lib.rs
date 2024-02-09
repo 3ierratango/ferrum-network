@@ -62,7 +62,7 @@ pub mod pallet {
 	/// Current pending transactions
 	#[pallet::storage]
 	#[pallet::getter(fn pending_transactions)]
-	pub type ProcessedTransactions<T> = StorageMap<_, Blake2_128Concat, Vec<u8>, Vec<u8>>;
+	pub type ProcessedTransactions<T> = StorageValue<_, Vec<Vec<u8>>>;
 
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
@@ -135,14 +135,26 @@ pub mod pallet {
 		#[pallet::weight(0)]
 		pub fn ext_record_seen_transactions(
 			origin: OriginFor<T>,
-			btc_address: Vec<u8>,
+			transactions: Vec<Vec<u8>, Vec<u8>>, // (recipient, transaction_id)
 		) -> DispatchResult {
 			// TODO : Ensure the caller is allowed to submit withdrawals
 			let who = ensure_signed(origin)?;
 
-			ProcessedTransactions::<T>::insert(btc_address.clone(), vec![]);
+			for tx_id in transactions.iter() {
+				ProcessedTransactions::<T>::insert(tx_id);
+				Self::deposit_event(Event::TransactionProcessed { btc_address: addr });
+			}
 
-			Self::deposit_event(Event::TransactionProcessed { btc_address });
+			Ok(())
+		}
+
+		#[pallet::call_index(2)]
+		#[pallet::weight(0)]
+		pub fn set_pool_address(origin: OriginFor<T>, pool_address: Vec<u8>) -> DispatchResult {
+			// TODO : Ensure the caller is allowed to submit withdrawals
+			let who = ensure_root(origin)?;
+
+			CurrentPoolAddress::<T>::put(pool_address);
 
 			Ok(())
 		}

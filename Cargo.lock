@@ -7556,6 +7556,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "pallet-btc-intent"
+version = "4.0.0-dev"
+dependencies = [
+ "bincode",
+ "bitcoin 0.29.2",
+ "bitcoincore-rpc",
+ "electrum-client",
+ "ethabi-nostd",
+ "ethereum",
+ "ferrum-primitives",
+ "frame-benchmarking",
+ "frame-support",
+ "frame-system",
+ "hex",
+ "libsecp256k1",
+ "log",
+ "numtoa",
+ "parity-scale-codec 3.6.9",
+ "reqwest",
+ "rlp",
+ "scale-info",
+ "secp256k1 0.24.3",
+ "serde",
+ "serde_json",
+ "sha256",
+ "sp-core",
+ "sp-io",
+ "sp-runtime",
+ "sp-std 8.0.0 (git+https://github.com/paritytech/polkadot-sdk.git?branch=release-polkadot-v1.1.0)",
+ "subxt",
+ "subxt-signer",
+ "tiny-keccak",
+ "tokio 1.35.1",
+ "web3",
+]
+
+[[package]]
 name = "pallet-child-bounties"
 version = "4.0.0-dev"
 source = "git+https://github.com/paritytech/polkadot-sdk.git?branch=release-polkadot-v1.1.0#c8d2251cafadc108ba2f1f8a3208dc547ff38901"

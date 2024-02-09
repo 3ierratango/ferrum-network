@@ -36,31 +36,12 @@ use sp_runtime::offchain::{
 	storage::StorageValueRef,
 	storage_lock::{StorageLock, Time},
 };
-pub mod traits;
+// pub mod traits;
+pub mod types;
 use sp_std::collections::btree_map::BTreeMap;
 pub use weights::*;
 pub mod offchain;
 use offchain::types::BTCConfig;
-
-#[derive(
-	Clone,
-	Eq,
-	PartialEq,
-	Decode,
-	Encode,
-	Debug,
-	Serialize,
-	Deserialize,
-	scale_info::TypeInfo,
-	Default,
-)]
-pub struct TransactionDetails {
-	pub signatures: SignatureMap,
-	pub recipient: Vec<u8>,
-	pub amount: u32,
-}
-
-pub type SignatureMap = BTreeMap<Vec<u8>, Vec<u8>>;
 
 #[frame_support::pallet]
 pub mod pallet {
@@ -75,9 +56,13 @@ pub mod pallet {
 
 	/// Configure the pallet by specifying the parameters and types on which it depends.
 	#[pallet::config]
-	pub trait Config: frame_system::Config + pallet_threshold_validators::Config {
+	pub trait Config: frame_system::Config {
 		/// Because this pallet emits events, it depends on the runtime's definition of an event.
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
+		/// The identifier type for an offchain worker.
+		type AuthorityId: AppCrypto<Self::Public, Self::Signature>;
+
+		type TransactionExpiryTimeout: Get<Self::BlockNumber>;
 		/// Type representing the weight of this pallet
 		type WeightInfo: WeightInfo;
 	}
@@ -108,8 +93,26 @@ pub mod pallet {
 		StorageMap<_, Blake2_128Concat, <T as frame_system::Config>::AccountId, Vec<u8>>;
 
 	#[pallet::storage]
+	#[pallet::getter(fn current_validators)]
+	pub type CurrentValidators<T> =
+		StorageValue<_, Vec<<T as frame_system::Config>::AccountId>, ValueQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn next_validators)]
+	pub type NextValidators<T> =
+		StorageValue<_, Vec<<T as frame_system::Config>::AccountId>, ValueQuery>;
+
+	#[pallet::storage]
 	#[pallet::getter(fn next_pool_address)]
 	pub type NextPoolAddress<T> = StorageValue<_, Vec<u8>, ValueQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn admin_role)]
+	pub type AdminRole<T: Config> = StorageValue<_, T::AccountId, ValueQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn is_pallet_paused)]
+	pub type IsPalletPaused<T> = StorageValue<_, bool, ValueQuery>;
 
 	#[pallet::storage]
 	#[pallet::getter(fn current_pool_threshold)]
@@ -124,11 +127,6 @@ pub mod pallet {
 	#[pallet::getter(fn registered_validators)]
 	pub type NextRegisteredValidators<T> =
 		StorageMap<_, Blake2_128Concat, <T as frame_system::Config>::AccountId, Vec<u8>>;
-
-	/// Current pending transactions
-	#[pallet::storage]
-	#[pallet::getter(fn pending_transactions)]
-	pub type PendingTransactions<T> = StorageMap<_, Blake2_128Concat, Vec<u8>, TransactionDetails>;
 
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
@@ -216,24 +214,24 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			address: Vec<u8>,
 			amount: u32,
-			hash: Vec<u8>,
+			transaction: TransactionDetails,
 		) -> DispatchResult {
 			// TODO : Ensure the caller is allowed to submit withdrawals
-			let _who = ensure_signed(origin)?;
+			let who = ensure_signed(origin)?;
+			let validators = CurrentValidators::<T>::get();
+			ensure!(validators.contains(who), Error::<T>::NoPermission);
 
-			// Update storage.
-			<PendingWithdrawals<T>>::remove(address.clone());
-
-			// add to unsigned transaction
-			let signatures: SignatureMap = Default::default();
-			let details: TransactionDetails =
-				TransactionDetails { signatures, amount, recipient: address.clone() };
-			PendingTransactions::<T>::insert(hash.clone(), details);
-			<PendingWithdrawals<T>>::remove(address.clone());
+			PendingWithdrawals::<T>::try_mutate(
+				address.clone(),
+				amount,
+				|withdrawal| -> DispatchResult {
+					withdrawal.insert_new_transaction(transaction).unwrap();
+					Ok(())
+				},
+			);
 
 			// Emit an event.
-			Self::deposit_event(Event::TransactionSubmitted { address, amount, hash });
-			// Return a successful DispatchResultWithPostInfo
+			Self::deposit_event(Event::TransactionSubmitted { address, amount, transaction });
 			Ok(())
 		}
 
@@ -241,32 +239,94 @@ pub mod pallet {
 		#[pallet::weight(T::WeightInfo::do_something())]
 		pub fn submit_transaction_signature(
 			origin: OriginFor<T>,
-			hash: Vec<u8>,
+			address: Vec<u8>,
+			amount: u32,
 			signature: Vec<u8>,
 		) -> DispatchResult {
-			// TODO : Ensure the caller is allowed to submit withdrawals
+			// Ensure the caller is allowed to submit signatures
 			let who = ensure_signed(origin)?;
+			let validators = CurrentValidators::<T>::get();
+			ensure!(validators.contains(who), Error::<T>::NoPermission);
 
-			let btc_address = RegisteredValidators::<T>::get(who).unwrap();
+			PendingWithdrawals::<T>::try_mutate(
+				address.clone(),
+				amount,
+				|withdrawal| -> DispatchResult {
+					withdrawal.insert_new_signature(who, signature).unwrap();
+					Ok(());
+				},
+			);
 
-			// Update storage.
-			PendingTransactions::<T>::try_mutate(hash.clone(), |details| -> DispatchResult {
-				let mut default = TransactionDetails::default();
-				let mut signatures = &mut details.as_mut().unwrap_or(&mut default).signatures;
-				signatures.insert(btc_address, signature.clone());
+			Ok(())
+		}
 
-				Self::deposit_event(Event::TransactionSignatureSubmitted {
-					hash: hash.clone(),
-					signature,
-				});
+		#[pallet::call_index(7)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn submit_transaction_broadcast_result(
+			origin: OriginFor<T>,
+			address: Vec<u8>,
+			amount: u32,
+			tx_id: Vec<u8>,
+		) -> DispatchResult {
+			// Ensure the caller is allowed to submit signatures
+			let who = ensure_signed(origin)?;
+			let validators = CurrentValidators::<T>::get();
+			ensure!(validators.contains(who), Error::<T>::NoPermission);
 
-				// if above threshold, complete
-				if signatures.len() as u32 >= CurrentPoolThreshold::<T>::get() {
-					Self::deposit_event(Event::TransactionProcessed { hash });
-				}
+			// basic sanity check
+			ensure!(!tx_id.is_empty(), Error::<T>::InvalidSubmission);
 
-				Ok(())
-			})
+			PendingWithdrawals::<T>::try_mutate(
+				address.clone(),
+				amount,
+				|withdrawal| -> DispatchResult {
+					withdrawal.set_tx_id(tx_id).unwrap();
+					Ok(());
+				},
+			);
+
+			Ok(())
+		}
+
+		#[pallet::call_index(8)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn submit_transaction_broadcasted_result(
+			origin: OriginFor<T>,
+			address: Vec<u8>,
+			amount: u32,
+		) -> DispatchResult {
+			// Ensure the caller is allowed to submit signatures
+			let who = ensure_signed(origin)?;
+			let validators = CurrentValidators::<T>::get();
+			ensure!(validators.contains(who), Error::<T>::NoPermission);
+
+			PendingWithdrawals::<T>::remove(address.clone(), amount);
+
+			Ok(())
+		}
+
+		#[pallet::call_index(9)]
+		#[pallet::weight(T::WeightInfo::do_something())]
+		pub fn submit_transaction_for_retry(
+			origin: OriginFor<T>,
+			address: Vec<u8>,
+			amount: u32,
+		) -> DispatchResult {
+			// Ensure the caller is allowed to submit signatures
+			let who = ensure_signed(origin)?;
+			let validators = CurrentValidators::<T>::get();
+			ensure!(validators.contains(who), Error::<T>::NoPermission);
+
+			PendingWithdrawals::<T>::try_mutate(
+				address.clone(),
+				amount,
+				|withdrawal| -> DispatchResult {
+					withdrawal.status = TransactionRetry;
+					Ok(());
+				},
+			);
+
+			Ok(())
 		}
 
 		#[pallet::call_index(3)]
@@ -317,9 +377,10 @@ pub mod pallet {
 			IsPalletPaused::<T>::set(true);
 
 			// check for new key in bos validators pallet
-			let next_threshold_validator_pub_key =
-				<pallet_threshold_validators::Pallet<T>>::NextPubKey::<T>::get()
-					.ok_or(Error::<T>::RequiresNextTresholdKey);
+			// TODO : Interface via trait
+			// let next_threshold_validator_pub_key =
+			// 	<pallet_threshold_validators::Pallet<T>>::NextPubKey::<T>::get()
+			// 		.ok_or(Error::<T>::RequiresNextTresholdKey);
 
 			let validators = RegisteredValidators::<T>::iter().collect::<Vec<_>>();
 
