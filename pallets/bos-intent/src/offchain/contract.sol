@@ -20,8 +20,9 @@ contract IntentRegistry {
         intents[intentsCount] = Intent({
             btcAmount: _btcAmount,
             btcAddress: _btcAddress,
-            targetContract: _targetContract,
-            encodedCall: _encodedCall,
+            remoteChainId: _remoteChainId,
+            remoteContract: remoteContract,
+            remoteMethodCall: _encodedCall,
             executed: false
         });
 
@@ -34,7 +35,16 @@ contract IntentRegistry {
         require(_intentId < intentsCount, "Intent does not exist");
         require(!intents[_intentId].executed, "Intent already executed");
 
+        // TODO : Should only be called by permitted address, should be a multisig of validators
+        // Multiple validators should signoff before we executeIntent (need threshold signers)
+
         // Execute the encoded call on the target contract
+        // TODO : Should be calling function run(
+        //     uint64 remoteChainId,
+        //     address remoteContract,
+        //     address beneficiary,
+        //     bytes memory remoteMethodCall
+        // )
         (bool success, ) = intents[_intentId].targetContract.call(intents[_intentId].encodedCall);
         require(success, "Execution of the encoded call failed");
 

@@ -328,6 +328,7 @@ pub fn handle_transaction_broadcast(
 	// we use a simple round robin to determin if its our turn to submit
 	let current_validators = CurrentValidators::<T>::get().iter().len();
 	let current_block = <T as frame_system::Config>::block_number();
+	// cb = 100, v = 5, 106 => 106%5=1, 107=2
 	let selected_validator_index = *current_block % current_validators as u32;
 	let selected_validator = current_validators.get(selected_validator_index as usize);
 

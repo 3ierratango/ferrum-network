@@ -115,6 +115,7 @@ impl BTCClient {
 		let secp = Secp256k1::new();
 
 		// ensure we can connect to BTC Client
+		// TODO : Document how to run Electrum node locally
 		let btc_client = Client::new("ssl://electrum.blockstream.info:60002")
 			.expect("Cannot establish connection to BTC Client!");
 
@@ -148,6 +149,7 @@ impl BTCClient {
 			utxos = Self::fetch_utxos(address);
 		}
 
+		// TODO : Incrment the amount by a small amount to cover the fee
 		let tx_ins = Self::filter_needed_utxos(amount.into(), utxos);
 
 		let recipient_address = String::from_utf8(recipient).expect("Found invalid UTF-8");
@@ -195,7 +197,7 @@ impl BTCClient {
 			candidate_utxos: Some(utxos),
 			consumed_utxos: Some(tx_ins),
 			prev_tx_hash: None,                           // this is our first transaction
-			timeout_block: current_block_number + 24_u32, // 4hour timeout
+			timeout_block: current_block_number + 24_u32, // 4hour timeout // TODO : move to global config
 			created_block: current_block_number,
 		};
 
@@ -310,6 +312,8 @@ impl BTCClient {
 			.iter()
 			.map(|x| XOnlyPublicKey::from_slice(x).unwrap())
 			.collect::<Vec<_>>();
+
+		// required that the vector is ordered
 		wallet_script.clone().push_x_only_key(&x_pub_keys.first().unwrap());
 		wallet_script.clone().push_opcode(all::OP_CHECKSIGVERIFY);
 
@@ -361,7 +365,7 @@ impl BTCClient {
 
 		// calculate the threshold value
 		// since one key is required, the threshold would be the remaining keys - 1
-		let threshold = x_pub_keys.len() - 1;
+		let threshold = x_pub_keys.len() - 2;
 
 		// add keys with OP_CHECKSIG for all keys except last
 		for key in &mut x_pub_keys[0..threshold] {
@@ -380,7 +384,7 @@ impl BTCClient {
 
 	// TODO : Should wait for prev transaction to be broadcasted
 	pub fn fetch_utxos(address: Address) -> Vec<ListUnspentRes> {
-		let client = Client::new("ssl://electrum.blockstream.info:60002").unwrap();
+		let client = Client::new("ssl://electrum.blockstream.info:60002").unwrap(); // TODO : Read from config
 		let tx_status = client.script_list_unspent(&address.script_pubkey()).unwrap();
 
 		println!("Found UTXOS {:?}", vec_tx_in);
@@ -559,7 +563,7 @@ impl BTCClient {
 		// for this we arrange the signature map in the same order as the expected validator order
 		let current_validators = CurrentValidators::<T>::get();
 		let mut ordered_signatures = Vec::with_capacity(current_validators.iter().len());
-
+		// [Alice, Bob, Charlie, Dave]
 		for (pos, validator_account) in current_validators.iter().enumerate() {
 			let signature = signatures.get(validator_account);
 
@@ -572,6 +576,7 @@ impl BTCClient {
 				ordered_signatures.insert(pos, vec![]);
 			}
 		}
+		// [Alice, Bob, [], Dave]
 
 		// here we loop in reverse since we are inserting to a stack, FIFO
 		for signature in ordered_signatures.iter().rev() {
@@ -613,7 +618,7 @@ impl BTCClient {
 	}
 
 	fn get_network_recommended_fee() -> Result<u64, ()> {
-		let api_url = "https://api.blockchain.info/mempool/fees";
+		let api_url = "https://api.blockchain.info/mempool/fees"; // TODO : THis should come from config
 
 		#[derive(serde::Serialize, serde::Deserialize)]
 		struct MempoolFees {
@@ -656,7 +661,7 @@ impl BTCClient {
 				let transaction_status: TransactionGetResponse =
 					transaction_status.unwrap().json().unwrap();
 				// we require atleast 3 confirmations
-				return transaction_status.confirmations > 3
+				return transaction_status.confirmations > 3 // TODO : Make this global config
 			},
 			Err(e) => {
 				log::info!("Transaction success check failed with error {:?}", e);

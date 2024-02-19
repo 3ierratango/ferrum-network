@@ -39,7 +39,7 @@ pub struct EvmClient;
 impl EvmClient {
 	fn handle_new_incoming_transaction(txids: Vec<Txid>) -> Vec<Txid> {
 		// read all intents on chain
-		let rpc_endpoint = "http://127.0.0.1:8545"; // local ferrum node
+		let rpc_endpoint = "http://127.0.0.1:8545"; // local ferrum node // TODO : From config same as qp offchain worker
 		let successfully_processed : Vec<Txid> = Default::default();
 
 		let intent_contract_address =
@@ -69,6 +69,7 @@ impl EvmClient {
 
 				let recipient_address = client.contract.intent_contract_address;
 
+				/// TODO: Add signature to pallet
 				let res = client.contract.send(
 					method_signature,
 					&inputs,

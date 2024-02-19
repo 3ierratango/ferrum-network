@@ -87,6 +87,11 @@ pub mod pallet {
 	#[pallet::getter(fn pending_withdrawals)]
 	pub type PendingWithdrawals<T> = StorageMap<_, Blake2_128Concat, Vec<u8>, u32>;
 
+	/// Current completed withdrawals
+	#[pallet::storage]
+	#[pallet::getter(fn pending_withdrawals)]
+	pub type CompletedWithdrawals<T> = StorageMap<_, Blake2_128Concat, Vec<u8>, u32>;
+
 	#[pallet::storage]
 	#[pallet::getter(fn registered_validators)]
 	pub type RegisteredValidators<T> =
@@ -300,8 +305,12 @@ pub mod pallet {
 			let validators = CurrentValidators::<T>::get();
 			ensure!(validators.contains(who), Error::<T>::NoPermission);
 
-			PendingWithdrawals::<T>::remove(address.clone(), amount);
+			let withdrawal = PendingWithdrawals::<T>::take(address.clone(), amount);
 
+			// TODO : this storage can be avoided, just add events
+			// TODO : Make every extrinsic to have an event
+			CompletedWithdrawals::<T>::insert((address.clone(), amount), withdrawal)
+		
 			Ok(())
 		}
 
@@ -321,6 +330,7 @@ pub mod pallet {
 				address.clone(),
 				amount,
 				|withdrawal| -> DispatchResult {
+					// TODO : recheck if timeout actually exceeded
 					withdrawal.status = TransactionRetry;
 					Ok(());
 				},

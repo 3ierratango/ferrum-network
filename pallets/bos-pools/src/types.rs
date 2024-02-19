@@ -31,6 +31,7 @@ pub struct TransactionDetails {
 	pub fees: u32,
 
 	/// An optional vector containing candidate Unspent Transaction Outputs (UTXOs).
+	// TODO : make this to Vec<(utxo, is_consumed)>
 	pub candidate_utxos: Option<Vec<ListUnspentRes>>,
 
 	/// A vector containing candidate Unspent Transaction Outputs (UTXOs) used in the tx_data

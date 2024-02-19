@@ -58,7 +58,7 @@ impl BTCClient {
 		current_pool_address: Vec<u8>,
 	) -> Result<ListReceivedByAddressResult, String> {
 		// Bitcoin RPC configuration
-		let rpc_url = "http://rpcuser:rpcpassword@127.0.0.1:8332";
+		let rpc_url = "http://rpcuser:rpcpassword@127.0.0.1:8332"; // TODO : Load from config
 
 		// JSON-RPC request payload for listreceivedbyaddress
 		let json_rpc_request = serde_json::json!({

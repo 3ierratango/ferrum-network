@@ -1,1 +1,3 @@
-License: MIT-0
+Boston Pools Pallet
+
+This pallet manages
