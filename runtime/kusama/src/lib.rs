@@ -21,6 +21,7 @@ use frame_support::derive_impl;
 use frame_support::{
 	construct_runtime,
 	dispatch::DispatchClass,
+	genesis_builder_helper::{build_state, get_preset},
 	pallet_prelude::TransactionValidityError,
 	parameter_types,
 	traits::{
@@ -367,7 +368,7 @@ parameter_types! {
 
 /// Maximum number of blocks simultaneously accepted by the Runtime, not yet included into the
 /// relay chain.
-pub const UNINCLUDED_SEGMENT_CAPACITY: u32 = 1;
+pub const UNINCLUDED_SEGMENT_CAPACITY: u32 = 3;
 /// How many parachain blocks are processed by the relay chain per parent. Limits the number of
 /// blocks authored per slot.
 pub const BLOCK_PROCESSING_VELOCITY: u32 = 1;
@@ -449,7 +450,7 @@ impl pallet_aura::Config for Runtime {
 	type AuthorityId = AuraId;
 	type DisabledValidators = ();
 	type MaxAuthorities = ConstU32<100_000>;
-	type AllowMultipleBlocksPerSlot = ConstBool<false>;
+	type AllowMultipleBlocksPerSlot = ConstBool<true>;
 	type SlotDuration = ConstU64<SLOT_DURATION>;
 }
 
@@ -767,6 +768,15 @@ impl_runtime_apis! {
 
 		fn authorities() -> Vec<AuraId> {
 			pallet_aura::Authorities::<Runtime>::get().into_inner()
+		}
+	}
+
+	impl cumulus_primitives_aura::AuraUnincludedSegmentApi<Block> for Runtime {
+		fn can_build_upon(
+			included_hash: <Block as BlockT>::Hash,
+			slot: cumulus_primitives_aura::Slot,
+		) -> bool {
+			ConsensusHook::can_build_upon(included_hash, slot)
 		}
 	}
 
@@ -1216,6 +1226,20 @@ impl_runtime_apis! {
 
 			if batches.is_empty() { return Err("Benchmark not found for this pallet.".into()) }
 			Ok(batches)
+		}
+	}
+
+	impl sp_genesis_builder::GenesisBuilder<Block> for Runtime {
+		fn build_state(config: Vec<u8>) -> sp_genesis_builder::Result {
+			build_state::<RuntimeGenesisConfig>(config)
+		}
+
+		fn get_preset(id: &Option<sp_genesis_builder::PresetId>) -> Option<Vec<u8>> {
+			get_preset::<RuntimeGenesisConfig>(id, |_| None)
+		}
+
+		fn preset_names() -> Vec<sp_genesis_builder::PresetId> {
+			Default::default()
 		}
 	}
 }

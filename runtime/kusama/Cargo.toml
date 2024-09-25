@@ -89,7 +89,7 @@ precompile-utils = { workspace = true }
 cumulus-primitives-aura = { workspace = true }
 pallet-message-queue = { workspace = true }
 parachains-common = { workspace = true }
-
+sp-genesis-builder = { workspace = true }
 # Local Dependencies
 ferrum-primitives = { workspace = true }
 pallet-quantum-portal = { workspace = true }
@@ -179,6 +179,7 @@ std = [
     "pallet-utility/std",
     "pallet-collective/std",
     "pallet-evm-precompile-quantum-portal/std",
+	"sp-genesis-builder/std",
 ]
 
 runtime-benchmarks = [
