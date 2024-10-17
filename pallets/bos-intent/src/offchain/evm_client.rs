@@ -32,6 +32,8 @@ use sp_std::{
 	prelude::*,
 	str,
 };
+use sp_runtime::traits::Zero;
+use ethabi::{encode, decode, Token, ParamType};
 
 #[derive(Debug, Clone)]
 pub struct EvmClient;
@@ -90,16 +92,117 @@ impl EvmClient {
 
 		return successfully_processed;
 	}
+
+	pub fn process_evm_block(&self, block_number: U256) -> Result<(), ChainRequestError> {
+		let block = self.get_block_with_transactions(block_number)?;
+		
+		for tx in block.transactions {
+			self.process_transaction(tx, block_number, block.timestamp)?;
+		}
+
+		Ok(())
+	}
+
+	fn process_transaction(&self, tx: Transaction, block_number: U256, timestamp: U256) -> Result<(), ChainRequestError> {
+		let multi_transfer_data = self.extract_multi_transfer_data(tx, block_number, timestamp)?;
+		self.call_multi_transfer(multi_transfer_data)
+	}
+
+	fn extract_multi_transfer_data(&self, tx: Transaction, block_number: U256, timestamp: U256) -> Result<MultiTransferData, ChainRequestError> {
+		let decoded = decode(&[
+			ParamType::Array(Box::new(ParamType::Address)),
+			ParamType::Array(Box::new(ParamType::Uint(256))),
+			ParamType::Array(Box::new(ParamType::Address)),
+			ParamType::Array(Box::new(ParamType::Uint(256))),
+			ParamType::Bytes,
+		], &tx.input).map_err(|_| ChainRequestError::DecodingError)?;
+
+		Ok(MultiTransferData {
+			froms: decoded[0].clone().into_array().unwrap().into_iter().map(|v| v.into_address().unwrap()).collect(),
+			inputs: decoded[1].clone().into_array().unwrap().into_iter().map(|v| v.into_uint().unwrap()).collect(),
+			tos: decoded[2].clone().into_array().unwrap().into_iter().map(|v| v.into_address().unwrap()).collect(),
+			values: decoded[3].clone().into_array().unwrap().into_iter().map(|v| v.into_uint().unwrap()).collect(),
+			block_number,
+			tx_id: tx.hash,
+			timestamp,
+			remote_call: decoded[4].clone().into_bytes().unwrap(),
+		})
+	}
+
+	fn call_multi_transfer(&self, data: MultiTransferData) -> Result<(), ChainRequestError> {
+		let function = ethabi::Function {
+			name: "multiTransfer".to_string(),
+			inputs: vec![
+				ethabi::Param { name: "froms".to_string(), kind: ethabi::ParamType::Array(Box::new(ethabi::ParamType::Address)) },
+				ethabi::Param { name: "inputs".to_string(), kind: ethabi::ParamType::Array(Box::new(ethabi::ParamType::Uint(256))) },
+				ethabi::Param { name: "tos".to_string(), kind: ethabi::ParamType::Array(Box::new(ethabi::ParamType::Address)) },
+				ethabi::Param { name: "values".to_string(), kind: ethabi::ParamType::Array(Box::new(ethabi::ParamType::Uint(256))) },
+				ethabi::Param { name: "blocknumber".to_string(), kind: ethabi::ParamType::Uint(256) },
+				ethabi::Param { name: "txid".to_string(), kind: ethabi::ParamType::FixedBytes(32) },
+				ethabi::Param { name: "timestamp".to_string(), kind: ethabi::ParamType::Uint(256) },
+				ethabi::Param { name: "remoteCall".to_string(), kind: ethabi::ParamType::Bytes },
+			],
+			outputs: vec![],
+			constant: false,
+		};
+
+		let encoded = function.encode_input(&[
+			Token::Array(data.froms.into_iter().map(Token::Address).collect()),
+			Token::Array(data.inputs.into_iter().map(Token::Uint).collect()),
+			Token::Array(data.tos.into_iter().map(Token::Address).collect()),
+			Token::Array(data.values.into_iter().map(Token::Uint).collect()),
+			Token::Uint(data.block_number),
+			Token::FixedBytes(data.tx_id.as_bytes().to_vec()),
+			Token::Uint(data.timestamp),
+			Token::Bytes(data.remote_call),
+		]).map_err(|_| ChainRequestError::EncodingError)?;
+
+		let contract_address = self.get_qp_erc20_address()?;
+
+		self.send(
+			function.short_signature(),
+			&[],
+			None,
+			None,
+			U256::zero(),
+			None,
+			self.signer.from,
+			&self.signer,
+			contract_address,
+		)?;
+
+		Ok(())
+	}
+
+	fn get_qp_erc20_address(&self) -> Result<Address, ChainRequestError> {
+		unimplemented!()
+	}
+
+	fn get_block_with_transactions(&self, block_number: U256) -> Result<Block, ChainRequestError> {
+		let req = JsonRpcRequest {
+			id: 1,
+			params: vec![
+				ChainUtils::u256_to_hex_0x(&block_number),
+				b"true".to_vec(),
+			],
+			method: b"eth_getBlockByNumber".to_vec(),
+		};
+		let http_api = str::from_utf8(&self.http_api[..]).unwrap();
+		let response: Box<BlockResponse> = fetch_json_rpc(http_api, &req)?;
+		Ok(response.result)
+	}
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
-pub struct Intent {
-	id: u8,
-	btc_amount: U256,
-	btc_address: Address,
-	target_contract: Address,
-	encoded_call: Box<[u8]>,
-	executed: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiTransferData {
+	froms: Vec<Address>,
+	inputs: Vec<U256>,
+	tos: Vec<Address>,
+	values: Vec<U256>,
+	block_number: U256,
+	tx_id: H256,
+	timestamp: U256,
+	remote_call: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -336,4 +439,31 @@ impl ContractClient {
 		let gp = ChainUtils::hex_to_u256(rv.result.as_slice())?;
 		Ok(gp)
 	}
+}
+
+#[derive(Debug, Clone)]
+struct Transaction {
+	hash: H256,
+	input: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct Block {
+	transactions: Vec<Transaction>,
+	timestamp: U256,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockResponse {
+	result: Block,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
+pub struct Intent {
+	id: u8,
+	btc_amount: U256,
+	btc_address: Address,
+	target_contract: Address,
+	encoded_call: Box<[u8]>,
+	executed: bool,
 }

@@ -52,15 +52,31 @@ where
 		handle: &mut impl PrecompileHandle,
 		submission: BoundedBytes<GetSubmissionSizeLimit>,
 	) -> EvmResult {
-		// // Convert Ethereum address to Substrate account ID
-		// let permitted_caller = Runtime::AddressMapping::into_account_id(submission.0);
+		// Convert Ethereum address to Substrate account ID
+		let permitted_caller = Runtime::AddressMapping::into_account_id(submission.0);
 
-		// let submission: Vec<u8> = submission.into();
+		let submission: Vec<u8> = submission.into();
 
-		// let call = BtcPoolsCall::<Runtime>::register_btc_validator { submission };
+		let call = BtcPoolsCall::<Runtime>::register_btc_validator { submission };
 
-		// // Dispatch the call using the RuntimeHelper
-		// <RuntimeHelper<Runtime>>::try_dispatch(handle, Some(origin).into(), call)?;
+		// Dispatch the call using the RuntimeHelper
+		<RuntimeHelper<Runtime>>::try_dispatch(handle, Some(origin).into(), call)?;
+
+		Ok(())
+	}
+
+	#[precompile::public("submitWithdrawalRequest(bytes32,uint32)")]
+    fn submit_withdrawal_request(
+        handle: &mut impl PrecompileHandle,
+        address: H256,
+        amount: u32,
+    ) -> EvmResult {
+        let caller = handle.context().caller;
+        let origin = Runtime::AddressMapping::into_account_id(caller);
+
+        let call = BtcPoolsCall::<Runtime>::submit_withdrawal_request { address, amount };
+
+        RuntimeHelper::<Runtime>::try_dispatch(handle, Some(origin).into(), call)?;
 
 		Ok(())
 	}
