@@ -34,63 +34,67 @@ use sp_std::{
 };
 use sp_runtime::traits::Zero;
 use ethabi::{encode, decode, Token, ParamType};
+use crate::{BitcoinTransaction, TransferItem, Pallet, Config};
+use sp_runtime::traits::StaticLookup;
 
 #[derive(Debug, Clone)]
 pub struct EvmClient;
 
 impl EvmClient {
-	fn handle_new_incoming_transaction(txids: Vec<Txid>) -> Vec<Txid> {
-		// read all intents on chain
+	fn handle_new_incoming_transaction<T: Config>(txids: Vec<Txid>) -> Vec<Txid> {
 		let rpc_endpoint = "http://127.0.0.1:8545"; // local ferrum node // TODO : From config same as qp offchain worker
-		let successfully_processed : Vec<Txid> = Default::default();
+		let successfully_processed: Vec<Txid> = Default::default();
 
 		let intent_contract_address =
 			ChainUtils::hex_to_address(b"c1F13fde5fFDE7B7ae6C95C9190d038A2eEb9e29"); // TODO : Read from config
 		let client = ContractClient::new(rpc_endpoint.into(), &intent_contract_address, 26100);
 		let intents = client.get_registered_intents().unwrap();
 
-		// lets decode all btc transactionids
-		let transactions: BTreeMap<(u64, Address), TxId> = Default::default();
-
 		for txid in txids {
-			// read the sender from the transaction
-			let tx = BTCClient::get_transaction_details(current_pool_address).unwrap();
-			let sender = BTCClient::extract_public_key_from_script(
-				&tx.vin[0].script_sig.as_bytes().to_vec(),
-			);
-			transactions.insert(txid, (tx.output[0].value, sender));
-		}
+			// read the transaction details
+			let tx = BTCClient::get_transaction_details(txid).unwrap();
+			let block = BTCClient::get_block_height(tx.block_hash).unwrap();
+			let timestamp = BTCClient::get_block_timestamp(tx.block_hash).unwrap();
 
-		// search if any intents have sent tx
-		for intent in intents {
-			if let Some(tx_id) = transactions.get((intent.btc_amount, intent.btc_address)) {
-				// send call to execute intent
-				let inputs = [Token::Uint(U256::from(intent.id))];
+			let inputs: Vec<TransferItem> = tx.vin.iter().map(|input| TransferItem {
+				address: input.script_sig.as_bytes().to_vec(),
+				amount: input.value,
+			}).collect();
 
-				let method_signature = b"executeIntent(uint256)";
+			let outputs: Vec<TransferItem> = tx.vout.iter().map(|output| TransferItem {
+				address: output.script_pubkey.as_bytes().to_vec(),
+				amount: output.value,
+			}).collect();
 
-				let recipient_address = client.contract.intent_contract_address;
+			let encoded_call = extract_encoded_call(&tx); // Implement this function
 
-				/// TODO: Add signature to pallet
-				let res = client.contract.send(
-					method_signature,
-					&inputs,
-					None, //Some(U256::from(1000000 as u64)), // None,
-					None, //Some(U256::from(10000000000 as u64)), // None,
-					U256::zero(),
-					None,
-					client.signer.from,
-					&client.signer,
-					recipient_address,
-				)?;
+			// Store the transaction data in the pallet storage
+			let bitcoin_tx = BitcoinTransaction {
+				block,
+				timestamp,
+				inputs,
+				outputs,
+				encoded_call,
+			};
 
-				if res.is_ok() {
-					successfully_processed.push(txid)
+			<Pallet<T>>::insert_bitcoin_transaction(txid.into(), bitcoin_tx);
+
+			// Check if this transaction matches any intents
+			if let Some(intent) = intents.iter().find(|intent| {
+				intent.btc_amount == U256::from(tx.vout[0].value) &&
+				intent.btc_address == ChainUtils::hex_to_address(&tx.vout[0].script_pubkey.as_bytes().to_vec())
+			}) {
+				// Execute the intent
+				if let Ok(()) = <Pallet<T>>::execute_intent(
+					T::Lookup::unlookup(intent.beneficiary.clone()),
+					U256::from(intent.id)
+				) {
+					successfully_processed.push(txid);
 				}
 			}
 		}
 
-		return successfully_processed;
+		successfully_processed
 	}
 
 	pub fn process_evm_block(&self, block_number: U256) -> Result<(), ChainRequestError> {
@@ -466,4 +470,18 @@ pub struct Intent {
 	target_contract: Address,
 	encoded_call: Box<[u8]>,
 	executed: bool,
+}
+
+// Add this function to extract the encoded call from the transaction
+fn extract_encoded_call(tx: &Transaction) -> Vec<u8> {
+	// Implement the logic to extract the encoded call from the transaction
+	// This is a placeholder implementation
+	Vec::new()
+}
+
+// Add this trait implementation for the Pallet
+impl<T: Config> Pallet<T> {
+	pub fn insert_bitcoin_transaction(txid: H256, tx: BitcoinTransaction) {
+		<BitcoinTransactions<T>>::insert(txid, tx);
+	}
 }

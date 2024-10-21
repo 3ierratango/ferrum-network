@@ -1,162 +1,172 @@
-// Copyright 2019-2023 Ferrum Inc.
-// This file is part of Ferrum.
-
-// Ferrum is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-
-// Ferrum is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Ferrum.  If not, see <http://www.gnu.org/licenses/>.
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use codec::{Decode, Encode};
-use ferrum_primitives::{BTC_OFFCHAIN_SIGNER_CONFIG_KEY, BTC_OFFCHAIN_SIGNER_CONFIG_PREFIX};
-use frame_system::WeightInfo;
-/// Edit this file to define custom logic or remove it if it is not needed.
-/// Learn more about FRAME and the core library of Substrate FRAME pallets:
-/// <https://docs.substrate.io/reference/frame-pallets/>
-pub use pallet::*;
-use serde::{Deserialize, Serialize};
-use sp_runtime::offchain::{
-	storage::StorageValueRef,
-	storage_lock::{StorageLock, Time},
+use frame_support::{
+	dispatch::DispatchResult,
+	pallet_prelude::*,
+	traits::Currency,
 };
-use sp_std::collections::btree_map::BTreeMap;
-// pub mod offchain;
-// use offchain::types::BTCConfig;
+use frame_system::pallet_prelude::*;
+use sp_core::{H160, H256, U256};
+use sp_std::prelude::*;
 
-// use crate::offchain::btc_client::ListReceivedByAddressResult;
+pub use pallet::*;
+
+#[cfg(test)]
+mod mock;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+
+pub mod weights;
+pub use weights::*;
 
 #[frame_support::pallet]
 pub mod pallet {
 	use super::*;
-	use frame_support::pallet_prelude::*;
-	use frame_system::pallet_prelude::*;
-	use scale_info::prelude::{vec, vec::Vec};
 
 	#[pallet::pallet]
-	#[pallet::without_storage_info]
 	pub struct Pallet<T>(_);
 
-	/// Configure the pallet by specifying the parameters and types on which it depends.
 	#[pallet::config]
 	pub trait Config: frame_system::Config {
-		/// Because this pallet emits events, it depends on the runtime's definition of an event.
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
-		/// Type representing the weight of this pallet
+		type Currency: Currency<Self::AccountId>;
 		type WeightInfo: WeightInfo;
 	}
 
-	// The pallet's runtime storage items.
-	// https://docs.substrate.io/main-docs/build/runtime-storage/
 	#[pallet::storage]
-	#[pallet::getter(fn current_pool_address)]
-	pub type CurrentPoolAddress<T> = StorageValue<_, Vec<u8>, ValueQuery>;
+	#[pallet::getter(fn intents)]
+	pub type Intents<T: Config> = StorageMap<_, Blake2_128Concat, U256, Intent<T::AccountId>>;
 
-	/// Current pending transactions
 	#[pallet::storage]
-	#[pallet::getter(fn pending_transactions)]
-	pub type ProcessedTransactions<T> = StorageValue<_, Vec<Vec<u8>>>;
+	#[pallet::getter(fn intents_count)]
+	pub type IntentsCount<T: Config> = StorageValue<_, U256, ValueQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn bitcoin_transactions)]
+	pub type BitcoinTransactions<T: Config> = StorageMap<_, Twox64Concat, H256, BitcoinTransaction>;
 
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		WithdrawalSubmitted { address: Vec<u8>, amount: u32 },
-		TransactionProcessed { btc_address: Vec<u8> },
-		TransactionSignatureSubmitted { hash: Vec<u8>, signature: Vec<u8> },
-		TransactionProcessed { hash: Vec<u8> },
+		IntentRegistered {
+			id: U256,
+			btc_amount: U256,
+			btc_address: H160,
+			target_contract: H160,
+			encoded_call: Vec<u8>,
+		},
+		IntentExecuted {
+			id: U256,
+		},
 	}
 
-	// Errors inform users that something went wrong.
 	#[pallet::error]
 	pub enum Error<T> {
-		/// Error names should be descriptive.
-		NoneValue,
-		/// Errors should have helpful documentation associated with them.
-		StorageOverflow,
+		IntentNotFound,
+		IntentAlreadyExecuted,
+		ExecutionFailed,
 	}
 
-	#[pallet::hooks]
-	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
-		fn offchain_worker(block_number: BlockNumberFor<T>) {
-			log::info!("BTCPools OffchainWorker : Start Execution");
-			log::info!("Reading configuration from storage");
+	#[derive(Clone, Encode, Decode, Eq, PartialEq, RuntimeDebug, Default, TypeInfo)]
+	pub struct Intent<AccountId> {
+		pub btc_amount: U256,
+		pub btc_address: H160,
+		pub target_contract: H160,
+		pub encoded_call: Vec<u8>,
+		pub executed: bool,
+		pub beneficiary: AccountId,
+	}
 
-			// if the pallet is paused, we dont execute the offchain worker
-			if IsPalletPaused::<T>::get() {
-				log::info!("BOS Validators : Pallet paused, not executing offchain worker!");
-				return
-			}
+	#[derive(Clone, Encode, Decode, Eq, PartialEq, RuntimeDebug, TypeInfo)]
+	pub struct BitcoinTransaction {
+		pub block: u64,
+		pub timestamp: u64,
+		pub inputs: Vec<TransferItem>,
+		pub outputs: Vec<TransferItem>,
+		pub encoded_call: Vec<u8>,
+	}
 
-			let mut lock = StorageLock::<Time>::new(BTC_OFFCHAIN_SIGNER_CONFIG_PREFIX);
-			if let Ok(_guard) = lock.try_lock() {
-				let network_config = StorageValueRef::persistent(BTC_OFFCHAIN_SIGNER_CONFIG_KEY);
-
-				let decoded_config = network_config.get::<BTCConfig>();
-				log::info!("BTC Pools : Decoded config is {:?}", decoded_config);
-
-				if let Err(_e) = decoded_config {
-					log::info!("Error reading configuration, exiting offchain worker");
-					return
-				}
-
-				if let Ok(None) = decoded_config {
-					log::info!("Configuration not found, exiting offchain worker");
-					return
-				}
-
-				if let Ok(Some(config)) = decoded_config {
-					let now = block_number.try_into().map_or(0_u64, |f| f);
-					log::info!("Current block: {:?}", block_number);
-					if let Err(e) = Self::execute_tx_scan(now, config) {
-						log::warn!(
-							"BTC Pools : Offchain worker failed to execute at block {:?} with
-	error : {:?}",
-							now,
-							e,
-						)
-					}
-				}
-			}
-
-			log::info!("BTC Pools : OffchainWorker : End Execution");
-		}
+	#[derive(Clone, Encode, Decode, Eq, PartialEq, RuntimeDebug, TypeInfo)]
+	pub struct TransferItem {
+		pub address: Vec<u8>,
+		pub amount: u64,
 	}
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		#[pallet::call_index(1)]
-		#[pallet::weight(0)]
-		pub fn ext_record_seen_transactions(
+		#[pallet::call_index(0)]
+		#[pallet::weight(T::WeightInfo::register_intent())]
+		pub fn register_intent(
 			origin: OriginFor<T>,
-			transactions: Vec<Vec<u8>, Vec<u8>>, // (recipient, transaction_id)
+			btc_amount: U256,
+			btc_address: H160,
+			target_contract: H160,
+			encoded_call: Vec<u8>,
 		) -> DispatchResult {
-			// TODO : Ensure the caller is allowed to submit withdrawals
 			let who = ensure_signed(origin)?;
 
-			for tx_id in transactions.iter() {
-				ProcessedTransactions::<T>::insert(tx_id);
-				Self::deposit_event(Event::TransactionProcessed { btc_address: addr });
-			}
+			let id = Self::intents_count();
+			let intent = Intent {
+				btc_amount,
+				btc_address,
+				target_contract,
+				encoded_call: encoded_call.clone(),
+				executed: false,
+				beneficiary: who,
+			};
+
+			<Intents<T>>::insert(id, intent);
+			<IntentsCount<T>>::put(id + U256::one());
+
+			Self::deposit_event(Event::IntentRegistered {
+				id,
+				btc_amount,
+				btc_address,
+				target_contract,
+				encoded_call,
+			});
 
 			Ok(())
 		}
 
-		#[pallet::call_index(2)]
-		#[pallet::weight(0)]
-		pub fn set_pool_address(origin: OriginFor<T>, pool_address: Vec<u8>) -> DispatchResult {
-			// TODO : Ensure the caller is allowed to submit withdrawals
-			let who = ensure_root(origin)?;
+		#[pallet::call_index(1)]
+		#[pallet::weight(T::WeightInfo::execute_intent())]
+		pub fn execute_intent(origin: OriginFor<T>, intent_id: U256) -> DispatchResult {
+			ensure_root(origin)?;
 
-			CurrentPoolAddress::<T>::put(pool_address);
+			let mut intent = Self::intents(intent_id).ok_or(Error::<T>::IntentNotFound)?;
+			ensure!(!intent.executed, Error::<T>::IntentAlreadyExecuted);
+
+			// TODO: Implement the actual execution logic here
+			// This might involve interacting with other pallets or external systems
+
+			intent.executed = true;
+			<Intents<T>>::insert(intent_id, intent);
+
+			Self::deposit_event(Event::IntentExecuted { id: intent_id });
 
 			Ok(())
+		}
+	}
+}
+
+impl<T: Config> Pallet<T> {
+	pub fn retrieve_tx(txid: H256) -> Option<(u64, u64, Vec<TransferItem>, Vec<TransferItem>, Vec<u8>)> {
+		if let Some(tx) = Self::bitcoin_transactions(txid) {
+			Some((
+				tx.block,
+				tx.timestamp,
+				tx.inputs,
+				tx.outputs,
+				tx.encoded_call,
+			))
+		} else {
+			None
 		}
 	}
 }
